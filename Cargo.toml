@@ -1,0 +1,66 @@
+[package]
+name = "wikikiki"
+version = "0.1.0"
+edition = "2021"
+description = "A wiki that is the live memory of a system of actors."
+license = "MIT OR Apache-2.0"
+
+[[bin]]
+name = "wikikiki"
+path = "src/main.rs"
+
+[lib]
+name = "wikikiki"
+path = "src/lib.rs"
+
+[dependencies]
+axum = { version = "0.7", features = ["macros"] }
+tokio = { version = "1", features = ["full"] }
+tower-http = { version = "0.5", features = ["trace"] }
+
+sqlx = { version = "0.8", default-features = false, features = [
+    "runtime-tokio-rustls",
+    "sqlite",
+    "macros",
+    "migrate",
+] }
+# Force the bundled SQLite C source so we don't depend on a system libsqlite3.
+# Still C — cross-compile needs a C toolchain — but no system library lookup.
+libsqlite3-sys = { version = "0.30", features = ["bundled"] }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_urlencoded = "0.7"
+toml = "0.8"
+
+comrak = "0.28"
+# Pure-Rust git. We need `tree.edit()` (added later in 0.x). The `index`
+# and `revision` features cover staging + revwalk; we leave the C-backed
+# crypto / zlib-ng features off so the whole tree stays pure Rust.
+gix = { version = "0.71", default-features = false, features = ["index", "revision", "tree-editor"] }
+
+argon2 = "0.5"
+rand = "0.8"
+sha2 = "0.10"
+hex = "0.4"
+
+maud = "0.26"
+
+chrono = "0.4"
+
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+anyhow = "1"
+thiserror = "1"
+
+clap = { version = "4", features = ["derive"] }
+
+[dev-dependencies]
+tempfile = "3"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "cookies"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1

@@ -1,0 +1,20 @@
+/target
+/wikikiki.db
+/wikikiki.db-shm
+/wikikiki.db-wal
+/wikikiki.toml
+.env
+*.log
+
+# Runtime wiki content (created by `wikikiki bootstrap` / `serve`).
+# Excluded so a developer running the binary in-tree doesn't commit
+# their local wiki state.
+/content/
+
+# Scratch / draft material — not part of the product.
+/inspiration/
+
+# Editor / agent session state.
+/.claude/
+/.vscode/
+/.idea/
