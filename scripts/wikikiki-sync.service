@@ -1,0 +1,14 @@
+[Unit]
+Description=wikikiki sync — mirror OpenClaw workspace into wikikiki
+After=network.target
+
+[Service]
+Type=simple
+User=tagent
+EnvironmentFile=/etc/default/wikikiki-sync
+ExecStart=/bin/bash /home/tagent/wikikiki/scripts/wikikiki-sync.sh
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=multi-user.target
