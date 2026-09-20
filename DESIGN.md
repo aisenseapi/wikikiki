@@ -463,7 +463,7 @@ This is a principle, not a convenience choice. The web UI is a *renderer* over m
 | Language | Rust | Performance + safety; good async story |
 | Web framework | `axum` | Mature, ergonomic, good WebSocket/SSE support |
 | Database | `sqlx` + SQLite | Compile-time checked queries; FTS5 for search |
-| Git | `gix` (preferred) or `git2` | `gix` is pure Rust; `git2` wraps libgit2 (more mature) |
+| Git | `gix` | Pure Rust, no libgit2 dependency. Shipped in Stage 1; `git2` was the alternative considered |
 | Markdown | `comrak` | CommonMark + GFM, fast, configurable |
 | Real-time | WebSocket or SSE | SSE simpler if traffic is mostly server→client |
 | Frontend | TBD — keep simple (server-rendered + HTMX?) | Avoid heavy SPA until needed |
@@ -1152,13 +1152,13 @@ Resolved (moved into the relevant sections):
 - ~~Multi-actor working memory visibility~~ → §15: `visibility` per thread (`public`/`participants`/`actor_only`), `public` by default.
 - ~~Loop detection across actors~~ → §3.5: edit-churn detection with configurable thresholds.
 - ~~Conflict branch garbage~~ → §14: 30-day retention after closed review thread; markdown snapshot preserved in the thread.
+- ~~`gix` vs `git2`~~ → §11: `gix` shipped in Stage 1 and covers what that stage needs — commit, tree editing, history walk, reading a blob at a commit. §14's conflict branches need branch creation and merge, which Stage 4 must confirm `gix` handles before committing to it.
 
 Still to decide:
 
 - **`content/` repo strategy:** submodule, nested repo, or same repo with conventions? (Path is configurable; this is an operator decision but a recommended default would help.)
 - **Commit cadence to L2:** `on_state_change` is the default; do we need `batched` from day one or can it wait?
 - **OAuth/SSO integration:** API tokens for non-`human` and cookies for `human` are confirmed. When (and which providers) for SSO?
-- **`gix` vs `git2`:** decide based on operations needed (branch creation + merge are required for §14). Configurable via `git.implementation`.
 - **Sub-page granularity:** one sub-page per dive, or accumulate in a single `notes.md` per topic? Probably a per-deployment style choice; needs a recommended default.
 - **Actor identity for distillation:** when a `system` distiller acts, does it get one generic `system:distiller` identity or one per policy (e.g. `system:l1-pruner`, `system:l3-maturer`)?
 - **`actor_only` rationale enforcement:** should the system reject `actor_only` threads without a rationale, or warn-and-allow?

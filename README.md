@@ -79,6 +79,7 @@ src/
 ├── db/            sqlx pool, migrations runner, queries
 ├── git/           gix wrapper for the content repo
 ├── web/           axum router, maud templates, auth middleware
+├── throttle.rs    coalesces last-seen/last-used writes off the request path
 └── actor/         REST API surface for agents
 migrations/        sqlx SQL migrations (lookups seeded here)
 content/           the wiki itself (markdown files; path is configurable)
