@@ -121,6 +121,19 @@ content/           the wiki itself (markdown files; path is configurable)
 
 ---
 
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md). The most useful contribution right now
+is not code: it is [running the handoff pilot](docs/HANDOFF_PILOT.md) and
+reporting what happened, including if nothing did.
+
+## Licence
+
+MIT or Apache-2.0, at your option — [LICENSE-MIT](LICENSE-MIT),
+[LICENSE-APACHE](LICENSE-APACHE).
+
+---
+
 A part of the TAGENT
 Private Edge Office Stack | An AI Agent Platform Project by AI VISIONS
 
