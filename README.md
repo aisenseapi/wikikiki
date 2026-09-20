@@ -10,6 +10,30 @@ See [DESIGN.md](DESIGN.md) for the full architecture document.
 
 Stages 2–4 (live working memory, distillation, hardening) are deferred per [§17](DESIGN.md#17-staged-delivery-plan).
 
+See [ROADMAP.md](ROADMAP.md) for the proposed delivery sequence and
+[the handoff pilot](docs/HANDOFF_PILOT.md) for five real-work trials using the
+current page API.
+
+## Write consistency
+
+Page writes through one shared server instance serialize file content, Git
+commits, metadata, edit history, and FTS updates in the same order. Unknown or
+inactive layers and invalid actor identities are rejected before content changes.
+An accepted write continues if its caller stops waiting, and normal server
+shutdown drains these writes before stopping the runtime.
+
+This is not a transaction across Git and SQLite. A process crash or a storage
+error after Git succeeds can still require reconciliation. Reads during a save
+are not guaranteed to return a snapshot across files and database metadata.
+Use one server per content repository and clone its shared `Repo` handle for
+library callers. Separate processes or separately opened handles do not share
+the writer lock. API writes still replace the whole page without revision checks
+or idempotency keys.
+
+Run `cargo test --locked` for the complete test suite. The
+`page_consistency` integration target checks the full persistence pipeline,
+including concurrent writers, rejected input, and cancelled callers.
+
 ## Quickstart
 
 ```sh
@@ -53,7 +77,7 @@ src/
 ├── lib.rs
 ├── config/        TOML loader with env overrides
 ├── db/            sqlx pool, migrations runner, queries
-├── git/           git2 wrapper for the content repo
+├── git/           gix wrapper for the content repo
 ├── web/           axum router, maud templates, auth middleware
 └── actor/         REST API surface for agents
 migrations/        sqlx SQL migrations (lookups seeded here)

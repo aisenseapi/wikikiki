@@ -3,19 +3,62 @@
 //! Token wire format: `wk_<lookup>_<secret>`
 //! - `lookup`: 16 hex chars (8 random bytes). Stored verbatim on the row
 //!   so the verifier can do an indexed lookup instead of scanning.
-//! - `secret`: 48 hex chars (24 random bytes). Argon2-hashed in
+//! - `secret`: 48 hex chars (24 random bytes), stored as a SHA-256 digest in
 //!   `credentials.secret_hash`. Plaintext is shown to the user once.
+//!
+//! ## Why SHA-256 here and Argon2 for passwords
+//!
+//! Argon2's cost is the whole point for a password: it buys time against
+//! offline guessing of a low-entropy secret a human chose. A token is 24
+//! bytes from the OS CSPRNG — 192 bits. There is no guessing attack to slow
+//! down, so the deliberate cost buys nothing and is paid on *every single API
+//! request*. At Argon2 defaults that is tens of milliseconds per call, which
+//! puts DESIGN.md §11's target ("well into hundreds of writes/sec") out of
+//! reach for reasons that have nothing to do with the database.
+//!
+//! A plain digest is the correct primitive for a high-entropy secret: it
+//! still means a leaked database yields no usable tokens, at roughly a
+//! microsecond. The comparison is constant-time so the digest cannot be
+//! recovered by timing.
+//!
+//! Credentials minted before this change carry an Argon2 PHC string. They are
+//! still accepted, and the row is transparently rewritten to a digest on
+//! first successful use — no reissue, no flag day.
 //!
 //! Revocation is immediate: setting `revoked_at` and the lookup misses
 //! immediately filter the row out.
 
 use rand::RngCore;
+use sha2::{Digest, Sha256};
 use sqlx::SqlitePool;
+use subtle::ConstantTimeEq;
 
 use crate::db::queries::Actor;
 use crate::error::{AppError, Result};
 
 pub const TOKEN_PREFIX: &str = "wk_";
+
+/// SHA-256 of the token secret, hex-encoded.
+fn secret_digest(secret: &str) -> String {
+    let mut h = Sha256::new();
+    h.update(secret.as_bytes());
+    hex::encode(h.finalize())
+}
+
+/// A stored Argon2 hash is a PHC string and always starts with `$`; a digest
+/// is bare hex and never does. That is enough to tell the two apart without
+/// a schema column to keep in sync.
+fn is_legacy_argon2(stored: &str) -> bool {
+    stored.starts_with('$')
+}
+
+/// Constant-time equality against the stored digest.
+fn digest_matches(secret: &str, stored: &str) -> bool {
+    secret_digest(secret)
+        .as_bytes()
+        .ct_eq(stored.as_bytes())
+        .into()
+}
 
 #[derive(Debug)]
 pub struct IssuedToken {
@@ -40,7 +83,7 @@ pub async fn issue(
     let secret = hex::encode(secret_bytes);
     let plaintext = format!("{TOKEN_PREFIX}{lookup}_{secret}");
 
-    let secret_hash = super::hash::hash(&secret)?;
+    let secret_hash = secret_digest(&secret);
     let now = crate::db::now_ts();
 
     let id = sqlx::query_scalar::<_, i64>(
@@ -73,8 +116,13 @@ fn parse_token(t: &str) -> Option<(&str, &str)> {
     }
 }
 
-/// Resolve a bearer token to its active actor. Touches `last_used_at` on hit.
-pub async fn verify(pool: &SqlitePool, token: &str) -> Result<Option<Actor>> {
+/// Resolve a bearer token to its active actor. Touches `last_used_at` on hit,
+/// subject to `touch` (see [`crate::throttle`]).
+pub async fn verify(
+    pool: &SqlitePool,
+    token: &str,
+    touch: &crate::throttle::Throttle,
+) -> Result<Option<Actor>> {
     let Some((lookup, secret)) = parse_token(token) else {
         return Ok(None);
     };
@@ -105,15 +153,41 @@ pub async fn verify(pool: &SqlitePool, token: &str) -> Result<Option<Actor>> {
         // Actor revoked.
         return Ok(None);
     }
-    if !super::hash::verify(secret, &row.1)? {
+
+    let credential_id = row.0;
+    let stored = &row.1;
+    if is_legacy_argon2(stored) {
+        if !super::hash::verify(secret, stored)? {
+            return Ok(None);
+        }
+        // Upgrade in place, once, on first successful use. Cheap here
+        // because we have just paid the Argon2 cost anyway, and it means the
+        // expensive path drains away on its own rather than needing a
+        // migration that cannot recompute one-way hashes.
+        let digest = secret_digest(secret);
+        if let Err(e) = sqlx::query("UPDATE credentials SET secret_hash = ? WHERE id = ?")
+            .bind(&digest)
+            .bind(credential_id)
+            .execute(pool)
+            .await
+        {
+            // A failed upgrade is not a failed authentication; the row stays
+            // legacy and we try again next time.
+            tracing::warn!(error = %e, credential_id, "token digest upgrade failed");
+        }
+    } else if !digest_matches(secret, stored) {
         return Ok(None);
     }
 
-    let _ = sqlx::query("UPDATE credentials SET last_used_at = ? WHERE id = ?")
-        .bind(crate::db::now_ts())
-        .bind(row.0)
-        .execute(pool)
-        .await;
+    // `last_used_at` has minute-resolution usefulness, so it does not justify
+    // a SQLite write lock on every authenticated request (DESIGN.md §11).
+    if touch.claim(credential_id, crate::db::now_ts()) {
+        let _ = sqlx::query("UPDATE credentials SET last_used_at = ? WHERE id = ?")
+            .bind(crate::db::now_ts())
+            .bind(credential_id)
+            .execute(pool)
+            .await;
+    }
 
     Ok(Some(Actor {
         id: row.2,
@@ -149,5 +223,39 @@ mod tests {
         assert!(parse_token(&good).is_some());
         assert!(parse_token("nope").is_none());
         assert!(parse_token(&format!("{TOKEN_PREFIX}aaaa_bbbb")).is_none());
+    }
+
+    #[test]
+    fn digest_accepts_the_secret_and_rejects_everything_else() {
+        let stored = secret_digest("s3cret");
+        assert!(digest_matches("s3cret", &stored));
+        assert!(!digest_matches("s3cres", &stored));
+        assert!(!digest_matches("", &stored));
+        assert!(!digest_matches("s3cret ", &stored));
+    }
+
+    #[test]
+    fn digest_is_bare_hex_so_it_never_looks_legacy() {
+        let d = secret_digest("whatever");
+        assert_eq!(d.len(), 64, "sha256 hex");
+        assert!(d.chars().all(|c| c.is_ascii_hexdigit()));
+        assert!(!is_legacy_argon2(&d));
+    }
+
+    /// The upgrade path hinges on telling the two encodings apart, so pin it
+    /// against a hash produced by the real hasher rather than a literal.
+    #[test]
+    fn argon2_phc_strings_are_recognised_as_legacy() {
+        let phc = crate::auth::hash::hash("s3cret").unwrap();
+        assert!(is_legacy_argon2(&phc), "got {phc}");
+        assert!(crate::auth::hash::verify("s3cret", &phc).unwrap());
+        // ...and must not be mistaken for a digest of the same secret.
+        assert!(!digest_matches("s3cret", &phc));
+    }
+
+    #[test]
+    fn mismatched_lengths_do_not_panic() {
+        assert!(!digest_matches("x", "short"));
+        assert!(!digest_matches("x", &"f".repeat(128)));
     }
 }

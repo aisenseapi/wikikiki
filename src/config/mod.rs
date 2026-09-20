@@ -93,6 +93,12 @@ pub struct Auth {
     pub token_default_lifetime: Option<HumanDuration>,
     /// How remote addresses are written to `access_log`: 'plain' | 'hashed' | 'none'.
     pub log_remote_addr: String,
+    /// Whether the session cookie carries `Secure`. `None` (the default)
+    /// derives it from `server.public_url`, so an HTTPS deployment gets the
+    /// flag without anyone having to remember it, and a plain-HTTP localhost
+    /// instance still works. Set explicitly when terminating TLS upstream
+    /// with an http:// public_url.
+    pub cookie_secure: Option<bool>,
 }
 
 impl Default for Auth {
@@ -101,6 +107,7 @@ impl Default for Auth {
             session_lifetime: HumanDuration(Duration::from_secs(30 * 24 * 60 * 60)),
             token_default_lifetime: Some(HumanDuration(Duration::from_secs(365 * 24 * 60 * 60))),
             log_remote_addr: "hashed".to_string(),
+            cookie_secure: None,
         }
     }
 }
@@ -186,6 +193,17 @@ fn format_duration(d: Duration) -> String {
 }
 
 impl Config {
+    /// Whether the session cookie should carry `Secure`.
+    ///
+    /// Defaults to "yes when we tell the world we are HTTPS". Without this the
+    /// cookie is sent in the clear on any plain-HTTP request to the same host,
+    /// which is exactly the case `Secure` exists to prevent.
+    pub fn cookie_secure(&self) -> bool {
+        self.auth
+            .cookie_secure
+            .unwrap_or_else(|| self.server.public_url.starts_with("https://"))
+    }
+
     /// Load from a TOML path. Missing file → defaults.
     pub fn load(path: Option<&std::path::Path>) -> Result<Self> {
         let base = if let Some(p) = path {
@@ -248,6 +266,22 @@ mod tests {
             let s = format_duration(d);
             assert_eq!(s, c, "roundtrip {c}");
         }
+    }
+
+    #[test]
+    fn cookie_secure_follows_public_url_unless_overridden() {
+        let mut cfg = Config::default();
+        assert!(!cfg.cookie_secure(), "http://localhost default");
+
+        cfg.server.public_url = "https://wiki.example.org".into();
+        assert!(cfg.cookie_secure(), "https public_url");
+
+        // Explicit override wins both ways — e.g. TLS terminated upstream.
+        cfg.auth.cookie_secure = Some(false);
+        assert!(!cfg.cookie_secure());
+        cfg.server.public_url = "http://localhost:8090".into();
+        cfg.auth.cookie_secure = Some(true);
+        assert!(cfg.cookie_secure());
     }
 
     #[test]

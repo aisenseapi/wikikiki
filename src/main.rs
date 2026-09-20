@@ -8,7 +8,6 @@
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
@@ -154,24 +153,60 @@ async fn serve(cfg: Config) -> Result<()> {
         .parse()
         .map_err(|e| wikikiki::error::AppError::Config(format!("server.bind '{}': {e}", cfg.server.bind)))?;
 
-    let state = AppState {
-        pool,
-        repo,
-        config: Arc::new(cfg),
-    };
+    let state = AppState::new(pool, repo, cfg);
+    let write_drain = state.repo.clone();
 
     let app = router(state);
     let listener = tokio::net::TcpListener::bind(bind).await
         .map_err(|e| wikikiki::error::AppError::Config(format!("bind {bind}: {e}")))?;
     tracing::info!("wikikiki listening on http://{}", bind);
 
-    axum::serve(
+    let result = axum::serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
+    .with_graceful_shutdown(shutdown_signal())
     .await
-    .map_err(|e| wikikiki::error::AppError::Internal(format!("serve: {e}")))?;
-    Ok(())
+    .map_err(|e| wikikiki::error::AppError::Internal(format!("serve: {e}")));
+    // A disconnected caller can leave an accepted write finishing in its
+    // own task. Drain that task before the runtime is allowed to stop.
+    write_drain.wait_for_writes().await;
+    result
+}
+
+/// Stop accepting new connections on Ctrl-C (or SIGTERM under a supervisor)
+/// and let in-flight requests finish.
+///
+/// A page write spans a git commit and a SQLite transaction; being killed
+/// between them is exactly the gap that leaves the search index describing
+/// content no page has. Draining does not make that boundary atomic, but it
+/// removes the most common way of landing in it.
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut s) => {
+                s.recv().await;
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "SIGTERM handler unavailable");
+                std::future::pending::<()>().await;
+            }
+        }
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {}
+        _ = terminate => {}
+    }
+    tracing::info!("shutdown signal received — draining");
 }
 
 fn parse_lifetime(cfg: &Config, raw: Option<&str>) -> Result<Option<i64>> {

@@ -6,7 +6,6 @@
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::Arc;
 
 use sqlx::SqlitePool;
 use tempfile::TempDir;
@@ -41,11 +40,7 @@ async fn spawn() -> Harness {
     let pool = connect_and_migrate(&db).await.expect("migrate");
     let repo = Repo::open_or_init(&content, &cfg.git.author_template).expect("git init");
 
-    let state = AppState {
-        pool: pool.clone(),
-        repo,
-        config: Arc::new(cfg),
-    };
+    let state = AppState::new(pool.clone(), repo, cfg);
 
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("addr");

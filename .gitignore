@@ -15,6 +15,9 @@
 /inspiration/
 
 # Editor / agent session state.
+/.agent-state/
 /.claude/
+/.codex/
+/.antigravity/
 /.vscode/
 /.idea/

@@ -17,18 +17,41 @@ use axum::routing::{get, post};
 use axum::Router;
 use serde::Deserialize;
 use sqlx::SqlitePool;
+use tower_http::trace::TraceLayer;
 
 use crate::auth::{self, Auth, Surface};
 use crate::config::Config;
 use crate::error::{AppError, Result};
 use crate::git::Repo;
 use crate::pages;
+use crate::throttle::Throttle;
+
+/// How coarse `actors.last_seen_at` and `credentials.last_used_at` are allowed
+/// to be. A minute is well inside what any observer of "who is active" cares
+/// about, and it removes a SQLite write from every authenticated request.
+const LIVENESS_INTERVAL_SECS: i64 = 60;
 
 #[derive(Clone)]
 pub struct AppState {
     pub pool: SqlitePool,
     pub repo: Repo,
     pub config: Arc<Config>,
+    /// Coalesces `actors.last_seen_at` writes.
+    pub actor_seen: Throttle,
+    /// Coalesces `credentials.last_used_at` writes.
+    pub credential_used: Throttle,
+}
+
+impl AppState {
+    pub fn new(pool: SqlitePool, repo: Repo, config: Config) -> Self {
+        Self {
+            pool,
+            repo,
+            config: Arc::new(config),
+            actor_seen: Throttle::new(LIVENESS_INTERVAL_SECS),
+            credential_used: Throttle::new(LIVENESS_INTERVAL_SECS),
+        }
+    }
 }
 
 pub fn router(state: AppState) -> Router {
@@ -58,7 +81,32 @@ pub fn router(state: AppState) -> Router {
             let s = mw_state.clone();
             async move { auth_middleware(s, req, next).await }
         }))
+        // Outside the auth layer so error responses carry the headers too.
+        .layer(from_fn(security_headers))
+        .layer(TraceLayer::new_for_http())
         .with_state(state)
+}
+
+/// Content-Security-Policy for every response.
+///
+/// `script-src 'none'` is not aspirational here — this UI contains no
+/// JavaScript at all, so the policy states a fact, and it is the strongest
+/// available backstop if markup ever escapes into a page despite the
+/// escaping in `templates`. Relax it when the first script actually lands,
+/// not in anticipation. Inline *styles* are still allowed because the
+/// stylesheet is embedded in the layout.
+const CSP: &str = "default-src 'self'; script-src 'none'; style-src 'self' 'unsafe-inline'; \
+                   img-src 'self' data:; form-action 'self'; frame-ancestors 'none'; \
+                   base-uri 'none'";
+
+async fn security_headers(req: Request, next: Next) -> Response {
+    let mut resp = next.run(req).await;
+    let h = resp.headers_mut();
+    h.insert("content-security-policy", HeaderValue::from_static(CSP));
+    h.insert("x-content-type-options", HeaderValue::from_static("nosniff"));
+    h.insert("referrer-policy", HeaderValue::from_static("same-origin"));
+    h.insert("x-frame-options", HeaderValue::from_static("DENY"));
+    resp
 }
 
 // =========================================================================
@@ -96,7 +144,9 @@ async fn auth_middleware(state: AppState, mut req: Request, next: Next) -> Respo
     match &auth_opt {
         Some(a) => {
             req.extensions_mut().insert(a.clone());
-            let _ = crate::db::queries::touch_actor_last_seen(&state.pool, a.actor.id).await;
+            if state.actor_seen.claim(a.actor.id, crate::db::now_ts()) {
+                let _ = crate::db::queries::touch_actor_last_seen(&state.pool, a.actor.id).await;
+            }
         }
         None => {
             req.extensions_mut().insert(Anonymous);
@@ -132,7 +182,9 @@ async fn resolve_actor(
     // 1. Bearer token (api surface, but also accepted on ui — useful for curl/dev).
     if let Some(s) = auth_header.as_deref() {
         if let Some(tok) = s.strip_prefix("Bearer ") {
-            if let Ok(Some(actor)) = auth::token::verify(&state.pool, tok).await {
+            if let Ok(Some(actor)) =
+                auth::token::verify(&state.pool, tok, &state.credential_used).await
+            {
                 return Some(Auth { actor, surface });
             }
         }
@@ -248,7 +300,11 @@ async fn login_submit(
                 remote.as_deref(),
             )
             .await;
-            let cookie = build_session_cookie(&sid, state.config.auth.session_lifetime.as_secs());
+            let cookie = build_session_cookie(
+                &sid,
+                state.config.auth.session_lifetime.as_secs(),
+                state.config.cookie_secure(),
+            );
             let mut resp = Redirect::to("/").into_response();
             resp.headers_mut().insert(header::SET_COOKIE, cookie);
             Ok(resp)
@@ -281,9 +337,7 @@ async fn logout(State(state): State<AppState>, req: Request) -> Response {
     let mut resp = Redirect::to("/").into_response();
     resp.headers_mut().insert(
         header::SET_COOKIE,
-        HeaderValue::from_static(
-            "wk_session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0",
-        ),
+        clear_session_cookie(state.config.cookie_secure()),
     );
     resp
 }
@@ -553,11 +607,24 @@ async fn api_search(
 // Helpers
 // =========================================================================
 
-fn build_session_cookie(sid: &str, max_age_secs: i64) -> HeaderValue {
+fn build_session_cookie(sid: &str, max_age_secs: i64, secure: bool) -> HeaderValue {
     let v = format!(
-        "{name}={sid}; Path=/; HttpOnly; SameSite=Lax; Max-Age={ma}",
+        "{name}={sid}; Path=/; HttpOnly; SameSite=Lax; Max-Age={ma}{secure}",
         name = auth::session::COOKIE_NAME,
         ma = max_age_secs,
+        secure = if secure { "; Secure" } else { "" },
+    );
+    HeaderValue::from_str(&v).expect("session cookie ascii")
+}
+
+/// Clearing the cookie has to match the attributes it was set with, or the
+/// browser keeps the original alongside the tombstone and logout silently
+/// fails to log anyone out.
+fn clear_session_cookie(secure: bool) -> HeaderValue {
+    let v = format!(
+        "{name}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0{secure}",
+        name = auth::session::COOKIE_NAME,
+        secure = if secure { "; Secure" } else { "" },
     );
     HeaderValue::from_str(&v).expect("session cookie ascii")
 }

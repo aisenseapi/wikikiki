@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use gix::bstr::{BStr, BString, ByteSlice};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, OwnedMutexGuard};
 
 use crate::error::{AppError, Result};
 
@@ -17,6 +17,12 @@ pub struct Repo {
     root: PathBuf,
     write_lock: Arc<Mutex<()>>,
     author_template: String,
+}
+
+/// One write order shared by Git and the page service's database projection.
+pub(crate) struct WriteSession {
+    repo: Repo,
+    guard: Arc<OwnedMutexGuard<()>>,
 }
 
 #[derive(Debug, Clone)]
@@ -58,25 +64,78 @@ impl Repo {
         &self.root
     }
 
-    /// Commit `relpath` (relative to repo root) with the given attribution.
-    /// The file must already exist on disk at its final location.
-    pub async fn commit_file(
+    /// Write `content` to `relpath` (relative to repo root) and commit it,
+    /// attributed to the given actor, as **one serialized operation**.
+    ///
+    /// Taking the content by value rather than re-reading the file is the
+    /// whole point. The previous shape — caller writes the file, then asks
+    /// git to commit whatever is at that path — had two defects that only
+    /// appear under concurrency, and they are the kind that destroy trust in
+    /// an attributed store:
+    ///
+    /// 1. The disk write happened *outside* this lock. Two actors saving the
+    ///    same page could interleave as `A writes → B writes → A commits`,
+    ///    and A's commit would carry B's bytes under A's name. Attribution
+    ///    silently wrong is worse than a failed write.
+    /// 2. Even serialized, re-reading reintroduces the gap: the bytes
+    ///    committed were never proven to be the bytes the caller validated.
+    ///
+    /// Holding one lock across both, and committing the same buffer that was
+    /// written, closes it: the file on disk and the blob in git are the same
+    /// bytes by construction.
+    pub async fn write_and_commit(
         &self,
         relpath: &Path,
+        content: &str,
         actor_type: &str,
         actor_handle: &str,
         message: &str,
     ) -> Result<String> {
+        self.write_session()
+            .await
+            .write_and_commit(relpath, content, actor_type, actor_handle, message)
+            .await
+    }
+
+    pub(crate) async fn write_session(&self) -> WriteSession {
+        WriteSession {
+            repo: self.clone(),
+            guard: Arc::new(self.write_lock.clone().lock_owned().await),
+        }
+    }
+
+    /// Drain accepted writes after the server stops accepting requests.
+    pub async fn wait_for_writes(&self) {
         let _guard = self.write_lock.lock().await;
-        let root = self.root.clone();
-        let author = render_author(&self.author_template, actor_type, actor_handle);
+    }
+}
+
+impl WriteSession {
+    pub(crate) async fn write_and_commit(
+        &self,
+        relpath: &Path,
+        content: &str,
+        actor_type: &str,
+        actor_handle: &str,
+        message: &str,
+    ) -> Result<String> {
+        let root = self.repo.root.clone();
+        let author = render_author(&self.repo.author_template, actor_type, actor_handle);
         let relpath = relpath.to_path_buf();
         let message = message.to_string();
+        let content = content.as_bytes().to_vec();
+        let guard = self.guard.clone();
 
         tokio::task::spawn_blocking(move || -> Result<String> {
+            // Cancellation cannot stop spawn_blocking once it has started.
+            // Keep the lock with the worker until its file/Git writes finish.
+            let _guard = guard;
             let repo = gix::open(&root).map_err(err)?;
             let abs_path = root.join(&relpath);
-            let content = std::fs::read(&abs_path)?;
+            if let Some(parent) = abs_path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(&abs_path, &content)?;
             let blob_id = repo.write_blob(&content).map_err(err)?.detach();
 
             // Build the new tree by editing the parent commit's tree (or
@@ -102,6 +161,33 @@ impl Repo {
                 .map_err(err)?;
 
             Ok(commit_id.detach().to_string())
+        })
+        .await
+        .map_err(|e| AppError::Internal(format!("join: {e}")))?
+    }
+}
+
+impl Repo {
+    /// The file's content as of `oid`, or `None` if it did not exist there.
+    ///
+    /// This is what makes attribution *checkable* rather than merely
+    /// recorded: given a commit, you can ask what it actually says, instead
+    /// of trusting that the author line and the bytes belong together.
+    pub async fn file_at_commit(&self, oid: &str, relpath: &Path) -> Result<Option<String>> {
+        let root = self.root.clone();
+        let relpath = relpath.to_path_buf();
+        let oid = oid.to_string();
+        tokio::task::spawn_blocking(move || -> Result<Option<String>> {
+            let repo = gix::open(&root).map_err(err)?;
+            let id = gix::ObjectId::from_hex(oid.as_bytes()).map_err(err)?;
+            let commit = repo.find_commit(id).map_err(err)?;
+            let tree_id = commit.tree_id().map_err(err)?.detach();
+            let target = path_to_bstring(&relpath)?;
+            let Some(blob_id) = lookup_path_in_tree(&repo, tree_id, target.as_bstr())? else {
+                return Ok(None);
+            };
+            let obj = repo.find_object(blob_id).map_err(err)?;
+            Ok(Some(String::from_utf8_lossy(&obj.data).into_owned()))
         })
         .await
         .map_err(|e| AppError::Internal(format!("join: {e}")))?
@@ -300,5 +386,94 @@ mod tests {
         let (n, e) = parse_sig("human:alice <alice@wikikiki.local>");
         assert_eq!(n, "human:alice");
         assert_eq!(e, "alice@wikikiki.local");
+    }
+
+    const TEMPLATE: &str = "{actor_type}:{actor_handle} <{actor_handle}@wikikiki.local>";
+
+    /// The regression guard for the cross-attribution race.
+    ///
+    /// With the disk write outside the lock and the content re-read inside
+    /// it, concurrent saves of one page interleaved as `A writes → B writes
+    /// → A commits`, and A's commit carried B's bytes under A's name. Here
+    /// every commit is asked what it actually contains, and it must be the
+    /// content its own author submitted.
+    #[tokio::test]
+    async fn concurrent_writes_never_cross_attribution() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let repo = Repo::open_or_init(tmp.path(), TEMPLATE).expect("init");
+        let rel = PathBuf::from("notes").join("shared.md");
+
+        let handles = ["alice", "bob", "carol", "dave", "erin", "frank"];
+        let mut tasks = Vec::new();
+        for who in handles {
+            let r = repo.clone();
+            let rel = rel.clone();
+            tasks.push(tokio::spawn(async move {
+                r.write_and_commit(
+                    &rel,
+                    &format!("content from {who}"),
+                    "human",
+                    who,
+                    &format!("edit by {who}"),
+                )
+                .await
+            }));
+        }
+        for t in tasks {
+            t.await.expect("join").expect("commit");
+        }
+
+        let history = repo.file_history(&rel, 50).await.expect("history");
+        assert_eq!(history.len(), handles.len(), "one commit per writer");
+
+        for c in &history {
+            let who = c
+                .author_name
+                .strip_prefix("human:")
+                .unwrap_or_else(|| panic!("unexpected author {}", c.author_name));
+            let content = repo
+                .file_at_commit(&c.oid, &rel)
+                .await
+                .expect("read blob")
+                .expect("file exists at its own commit");
+            assert_eq!(
+                content,
+                format!("content from {who}"),
+                "commit {} attributed to {who} carries another actor's bytes",
+                c.oid
+            );
+        }
+    }
+
+    /// Whatever the interleaving, the file left on disk must be exactly the
+    /// content of the last commit — not a blend, and not a stale write that
+    /// landed after the commit that was supposed to capture it.
+    #[tokio::test]
+    async fn disk_agrees_with_head_after_concurrent_writes() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let repo = Repo::open_or_init(tmp.path(), TEMPLATE).expect("init");
+        let rel = PathBuf::from("page.md");
+
+        let mut tasks = Vec::new();
+        for i in 0..8 {
+            let r = repo.clone();
+            let rel = rel.clone();
+            tasks.push(tokio::spawn(async move {
+                r.write_and_commit(&rel, &format!("body {i}"), "agent", &format!("a{i}"), "edit")
+                    .await
+            }));
+        }
+        for t in tasks {
+            t.await.expect("join").expect("commit");
+        }
+
+        let on_disk = std::fs::read_to_string(tmp.path().join(&rel)).expect("read file");
+        let newest = repo.file_history(&rel, 1).await.expect("history");
+        let in_git = repo
+            .file_at_commit(&newest[0].oid, &rel)
+            .await
+            .expect("read blob")
+            .expect("blob");
+        assert_eq!(on_disk, in_git, "disk and HEAD disagree");
     }
 }
