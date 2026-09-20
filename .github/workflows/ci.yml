@@ -83,5 +83,10 @@ jobs:
       - name: Formatting
         run: cargo fmt --all -- --check
 
+      # `continue-on-error` on the job keeps a lint failure from turning the
+      # workflow red, but steps within a job still short-circuit: without
+      # `always()` a formatting failure skips clippy entirely, and half the
+      # backlog this job exists to surface never gets reported.
       - name: Clippy
+        if: always()
         run: cargo clippy --locked --all-targets -- -D warnings
