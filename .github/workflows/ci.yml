@@ -1,0 +1,87 @@
+# Tests run on every push and pull request to main.
+#
+# The suite is the point: Stage 1's correctness *is* the interaction between
+# disk, Git, SQLite and FTS, and `tests/page_consistency.rs` asserts guarantees
+# that only hold under concurrency. Those are exactly the properties that rot
+# silently when nobody runs them.
+#
+# Only first-party actions are used, so the workflow adds no third-party
+# supply-chain surface. Rust comes preinstalled on the GitHub-hosted runners.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  # Fail fast in CI rather than retrying a locked database for five seconds.
+  RUST_BACKTRACE: 1
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Record toolchain
+        run: |
+          rustc --version
+          cargo --version
+
+      - name: Cache cargo registry and build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      # --locked fails rather than silently resolving a different dependency
+      # graph than the one the tests were verified against.
+      - name: Build
+        run: cargo build --locked --all-targets
+
+      - name: Test
+        run: cargo test --locked
+
+  lint:
+    name: Lint (informational)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    # Neither check passes on the current tree: rustfmt would reformat several
+    # files and clippy reports eight lints. Gating on them would mean a red CI
+    # that says nothing about whether the code works. They run here so the
+    # backlog stays visible, and should be promoted to blocking once the tree
+    # is clean — not before.
+    continue-on-error: true
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache cargo registry and build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ runner.os }}-cargo-lint-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-lint-
+
+      - name: Formatting
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
