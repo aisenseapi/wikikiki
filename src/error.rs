@@ -27,6 +27,12 @@ pub enum AppError {
     #[error("conflict: {0}")]
     Conflict(String),
 
+    /// A conditional write whose precondition no longer holds — the page
+    /// changed under the writer. Distinct from `Conflict` because the client
+    /// action differs: re-read, reconcile, retry.
+    #[error("precondition failed: {0}")]
+    PreconditionFailed(String),
+
     #[error("internal: {0}")]
     Internal(String),
 }
@@ -39,6 +45,7 @@ impl AppError {
             AppError::NotFound(_) => StatusCode::NOT_FOUND,
             AppError::BadRequest(_) => StatusCode::BAD_REQUEST,
             AppError::Conflict(_) => StatusCode::CONFLICT,
+            AppError::PreconditionFailed(_) => StatusCode::PRECONDITION_FAILED,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }

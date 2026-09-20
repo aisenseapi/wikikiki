@@ -52,13 +52,16 @@ impl Fixture {
             &self.pool,
             &self.repo,
             &self.content_root,
-            path,
-            "semantic",
-            "# Original\n\noriginalcontenttoken\n",
-            actor_id,
-            "agent",
-            handle,
-            Some("original page"),
+            pages::WriteRequest {
+                path,
+                layer: "semantic",
+                content: "# Original\n\noriginalcontenttoken\n",
+                actor_id,
+                actor_type: "agent",
+                actor_handle: handle,
+                summary: Some("original page"),
+                precondition: pages::Precondition::None,
+            },
         )
         .await
         .expect("seed page");
@@ -154,13 +157,16 @@ async fn concurrent_page_writes_keep_every_store_and_actor_in_agreement() {
                 &pool,
                 &repo,
                 &content_root,
-                PAGE,
-                "semantic",
-                &content,
-                actor_id,
-                "agent",
-                &handle,
-                Some(&format!("write by {handle}")),
+                pages::WriteRequest {
+                    path: PAGE,
+                    layer: "semantic",
+                    content: &content,
+                    actor_id,
+                    actor_type: "agent",
+                    actor_handle: &handle,
+                    summary: Some(&format!("write by {handle}")),
+                    precondition: pages::Precondition::None,
+                },
             )
             .await
         }));
@@ -315,13 +321,16 @@ async fn cancelling_a_request_after_git_does_not_abandon_its_database_projection
             &pool,
             &repo,
             &content_root,
-            PAGE,
-            "semantic",
-            CONTENT,
-            writer_id,
-            "agent",
-            "writer",
-            Some("survive request cancellation"),
+            pages::WriteRequest {
+                path: PAGE,
+                layer: "semantic",
+                content: CONTENT,
+                actor_id: writer_id,
+                actor_type: "agent",
+                actor_handle: "writer",
+                summary: Some("survive request cancellation"),
+                precondition: pages::Precondition::None,
+            },
         )
         .await
     });
@@ -449,13 +458,16 @@ async fn rejected_layer_preserves_all_stores(existing: bool, inactive: bool) {
         &fixture.pool,
         &fixture.repo,
         &fixture.content_root,
-        path,
-        layer,
-        "# Rejected\n\nrejectedcontenttoken\n",
-        actor_id,
-        "agent",
-        "writer",
-        Some("must not be committed"),
+        pages::WriteRequest {
+            path,
+            layer,
+            content: "# Rejected\n\nrejectedcontenttoken\n",
+            actor_id,
+            actor_type: "agent",
+            actor_handle: "writer",
+            summary: Some("must not be committed"),
+            precondition: pages::Precondition::None,
+        },
     )
     .await;
     assert!(
@@ -515,13 +527,16 @@ async fn invalid_actor_identity_cannot_change_any_store() {
                 &fixture.pool,
                 &fixture.repo,
                 &fixture.content_root,
-                path,
-                "semantic",
-                "# Unattributable\n\ninvalidactorcontenttoken\n",
-                id,
-                actor_type,
-                handle,
-                Some("must not be committed"),
+                pages::WriteRequest {
+                    path,
+                    layer: "semantic",
+                    content: "# Unattributable\n\ninvalidactorcontenttoken\n",
+                    actor_id: id,
+                    actor_type,
+                    actor_handle: handle,
+                    summary: Some("must not be committed"),
+                    precondition: pages::Precondition::None,
+                },
             )
             .await;
             assert!(

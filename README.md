@@ -27,12 +27,46 @@ error after Git succeeds can still require reconciliation. Reads during a save
 are not guaranteed to return a snapshot across files and database metadata.
 Use one server per content repository and clone its shared `Repo` handle for
 library callers. Separate processes or separately opened handles do not share
-the writer lock. API writes still replace the whole page without revision checks
-or idempotency keys.
+the writer lock. A write still replaces the whole page rather than merging, and
+there are no idempotency keys: a retried request that already succeeded writes
+again.
+
+## Conditional writes
+
+A write can name the revision it is modifying, so an actor cannot erase a
+change it never saw. This matters most for agents, which read a page, reason
+for a while, and write back a conclusion — without it, whoever is slowest wins.
+
+`GET` returns the current revision as an `ETag`, and `PUT` honours the
+matching conditional headers:
+
+| Request | Behaviour |
+|---|---|
+| `If-Match: "<revision>"` | Writes only if the page is still at that revision, otherwise `412` |
+| `If-Match: *` | Writes only if the page exists |
+| `If-None-Match: *` | Creates only if the page does not exist |
+| *(no condition)* | Last writer wins, unchanged |
+
+```sh
+etag=$(curl -sI -H "Authorization: Bearer $TOKEN" \
+        "$BASE/api/pages/notes/topic" | grep -i '^etag:' | cut -d' ' -f2- | tr -d '\r')
+
+curl -X PUT -H "Authorization: Bearer $TOKEN" -H "If-Match: $etag" \
+     --data 'updated body' "$BASE/api/pages/notes/topic"
+```
+
+The revision is a hash of the page content, so it means "the version that says
+*this*" and a client can verify it from bytes it already holds. The condition
+is evaluated inside the writer lock, immediately before the Git commit —
+checking it any earlier would leave the window it exists to close.
+
+Omitting the headers keeps the previous behaviour, so existing clients
+including `scripts/wikikiki-sync.sh` are unaffected.
 
 Run `cargo test --locked` for the complete test suite. The
 `page_consistency` integration target checks the full persistence pipeline,
-including concurrent writers, rejected input, and cancelled callers.
+including concurrent writers, rejected input, and cancelled callers;
+`end_to_end` covers the conditional-write surface.
 
 ## Quickstart
 

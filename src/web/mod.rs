@@ -368,7 +368,7 @@ async fn view_page(
             Err(e) => return Err(e),
         };
         return Ok(Html(
-            templates::edit_page(auth, &path, &content, meta.as_ref()).into_string(),
+            templates::edit_page(auth, &path, &content, meta.as_ref(), None).into_string(),
         )
         .into_response());
     }
@@ -393,6 +393,11 @@ struct SaveInput {
     content: String,
     summary: Option<String>,
     layer: Option<String>,
+    /// The revision the editor was opened against, carried through the form.
+    /// Empty when the page did not exist, which becomes "must still not
+    /// exist" — otherwise two people creating the same page at once would
+    /// leave one of them silently erased.
+    revision: Option<String>,
 }
 
 async fn save_page(
@@ -412,22 +417,50 @@ async fn save_page(
         .map_err(|e| AppError::BadRequest(format!("form: {e}")))?;
     let layer = input.layer.as_deref().unwrap_or("semantic");
 
+    let precondition = match input.revision.as_deref().map(str::trim) {
+        Some(rev) if !rev.is_empty() => pages::Precondition::Revision(rev.to_string()),
+        // The editor was opened on a page that did not exist.
+        Some(_) => pages::Precondition::Absent,
+        // No field at all: an older form, or a caller that did not opt in.
+        None => pages::Precondition::None,
+    };
+
     let result = pages::write(
         &state.pool,
         &state.repo,
         &state.config.paths.content_root,
-        &path,
-        layer,
-        &input.content,
-        auth.actor.id,
-        &auth.actor.actor_type,
-        &auth.actor.handle,
-        input.summary.as_deref(),
+        pages::WriteRequest {
+            path: &path,
+            layer,
+            content: &input.content,
+            actor_id: auth.actor.id,
+            actor_type: &auth.actor.actor_type,
+            actor_handle: &auth.actor.handle,
+            summary: input.summary.as_deref(),
+            precondition,
+        },
     )
     .await;
 
     match result {
         Ok(_meta) => Ok(Redirect::to(&format!("/wiki/{path}")).into_response()),
+        // The page moved under the editor. Returning the error alone would
+        // make the conflict *be* the data loss it exists to prevent, so the
+        // submitted text comes back in the form, now carrying the current
+        // revision: saving again is an informed overwrite rather than an
+        // accidental one.
+        Err(AppError::PreconditionFailed(reason)) => {
+            let current = pages::read_meta(&state.pool, &path).await.ok().flatten();
+            let body = templates::edit_page(
+                Some(&auth),
+                &path,
+                &input.content,
+                current.as_ref(),
+                Some(&reason),
+            )
+            .into_string();
+            Ok((StatusCode::PRECONDITION_FAILED, Html(body)).into_response())
+        }
         Err(e) => {
             auth::log_access(
                 &state.pool,
@@ -508,22 +541,31 @@ async fn api_get_page(
         .and_then(|v| v.to_str().ok())
         .map(|s| s.contains("application/json"))
         .unwrap_or(false);
-    if wants_json {
+    let mut resp = if wants_json {
         let body = serde_json::json!({
             "path": page.meta.path,
             "title": page.meta.title,
             "layer": page.meta.layer,
             "content": page.content,
             "last_edit_at": page.meta.last_edit_at,
+            "revision": page.meta.revision,
         });
-        Ok(axum::Json(body).into_response())
+        axum::Json(body).into_response()
     } else {
-        Ok((
+        (
             [(header::CONTENT_TYPE, "text/markdown; charset=utf-8")],
             page.content,
         )
-            .into_response())
+            .into_response()
+    };
+    // The revision a conditional write will name. Without it a client has no
+    // way to say "I am modifying the version I just read".
+    if let Some(rev) = page.meta.revision.as_deref() {
+        if let Ok(v) = HeaderValue::from_str(&etag_for(rev)) {
+            resp.headers_mut().insert(header::ETAG, v);
+        }
     }
+    Ok(resp)
 }
 
 async fn api_put_page(
@@ -552,27 +594,41 @@ async fn api_put_page(
     let content = String::from_utf8(bytes.to_vec())
         .map_err(|_| AppError::BadRequest("body must be UTF-8".into()))?;
 
+    let precondition = precondition_from_headers(&headers)?;
+
     let meta = pages::write(
         &state.pool,
         &state.repo,
         &state.config.paths.content_root,
-        &path,
-        &layer,
-        &content,
-        auth.actor.id,
-        &auth.actor.actor_type,
-        &auth.actor.handle,
-        summary.as_deref(),
+        pages::WriteRequest {
+            path: &path,
+            layer: &layer,
+            content: &content,
+            actor_id: auth.actor.id,
+            actor_type: &auth.actor.actor_type,
+            actor_handle: &auth.actor.handle,
+            summary: summary.as_deref(),
+            precondition,
+        },
     )
     .await?;
 
-    Ok(axum::Json(serde_json::json!({
+    let mut resp = axum::Json(serde_json::json!({
         "ok": true,
         "path": meta.path,
         "title": meta.title,
         "layer": meta.layer,
+        "revision": meta.revision,
     }))
-    .into_response())
+    .into_response();
+    // Hand back the new revision so a client can chain conditional writes
+    // without re-reading the page it just wrote.
+    if let Some(rev) = meta.revision.as_deref() {
+        if let Ok(v) = HeaderValue::from_str(&etag_for(rev)) {
+            resp.headers_mut().insert(header::ETAG, v);
+        }
+    }
+    Ok(resp)
 }
 
 #[derive(Deserialize)]
@@ -606,6 +662,64 @@ async fn api_search(
 // =========================================================================
 // Helpers
 // =========================================================================
+
+/// A page's revision as an HTTP entity tag.
+///
+/// Conditional writes use `ETag`/`If-Match` rather than a bespoke header
+/// because this is precisely what those headers are for, and every HTTP
+/// client already knows the vocabulary — including the 412 that comes back.
+fn etag_for(revision: &str) -> String {
+    format!("\"{revision}\"")
+}
+
+fn parse_etag(raw: &str) -> Option<&str> {
+    let raw = raw.trim();
+    // Weak validators (`W/"…"`) assert semantic rather than byte equality,
+    // which is not a distinction a lost-update check can act on.
+    raw.strip_prefix('"')?.strip_suffix('"')
+}
+
+/// Translate `If-Match` / `If-None-Match` into a precondition.
+///
+/// Only the cases that mean something here are honoured: an exact revision,
+/// `*` for "must exist", and `If-None-Match: *` for "must not exist". A list
+/// of candidate tags is rejected rather than half-supported, because silently
+/// ignoring the extra tags would weaken a guarantee the caller asked for.
+fn precondition_from_headers(headers: &HeaderMap) -> Result<pages::Precondition> {
+    let if_match = headers.get(header::IF_MATCH).and_then(|v| v.to_str().ok());
+    let if_none_match = headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|v| v.to_str().ok());
+
+    match (if_match, if_none_match) {
+        (Some(_), Some(_)) => Err(AppError::BadRequest(
+            "send If-Match or If-None-Match, not both".into(),
+        )),
+        (Some(m), None) => {
+            let m = m.trim();
+            if m == "*" {
+                Ok(pages::Precondition::Exists)
+            } else if m.contains(',') {
+                Err(AppError::BadRequest(
+                    "If-Match must carry a single entity tag".into(),
+                ))
+            } else {
+                parse_etag(m)
+                    .map(|rev| pages::Precondition::Revision(rev.to_string()))
+                    .ok_or_else(|| {
+                        AppError::BadRequest(
+                            "If-Match must be a quoted entity tag or *".into(),
+                        )
+                    })
+            }
+        }
+        (None, Some(n)) if n.trim() == "*" => Ok(pages::Precondition::Absent),
+        (None, Some(_)) => Err(AppError::BadRequest(
+            "If-None-Match is only supported as *".into(),
+        )),
+        (None, None) => Ok(pages::Precondition::None),
+    }
+}
 
 fn build_session_cookie(sid: &str, max_age_secs: i64, secure: bool) -> HeaderValue {
     let v = format!(

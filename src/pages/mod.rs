@@ -32,12 +32,20 @@ pub struct PageMeta {
     /// an extra query tends to quietly not get shown.
     pub last_edit_handle: Option<String>,
     pub last_edit_type: Option<String>,
+    /// The page's current revision: a hash of its content.
+    ///
+    /// Content-derived rather than a counter, which makes it meaningful on
+    /// its own — "the version that says *this*" — and lets a client verify it
+    /// from bytes it already holds. `None` only for rows written outside this
+    /// service, which therefore cannot prove what a conditional write is
+    /// being applied to.
+    pub revision: Option<String>,
 }
 
 /// `SELECT` list shared by every page-metadata query, so the column order
 /// the row tuples depend on is written once.
 const PAGE_META_COLUMNS: &str = "p.id, p.path, p.layer, p.title, p.last_edit_at, p.last_edit_by, \
-                                 a.handle, a.type";
+                                 a.handle, a.type, p.content_hash";
 
 type PageMetaRow = (
     i64,
@@ -46,6 +54,7 @@ type PageMetaRow = (
     String,
     Option<i64>,
     Option<i64>,
+    Option<String>,
     Option<String>,
     Option<String>,
 );
@@ -60,6 +69,7 @@ fn page_meta_from_row(r: PageMetaRow) -> PageMeta {
         last_edit_by: r.5,
         last_edit_handle: r.6,
         last_edit_type: r.7,
+        revision: r.8,
     }
 }
 
@@ -67,6 +77,90 @@ fn page_meta_from_row(r: PageMetaRow) -> PageMeta {
 pub struct Page {
     pub meta: PageMeta,
     pub content: String,
+}
+
+/// What the page must currently look like for a write to be allowed.
+///
+/// This is optimistic concurrency, and it exists because the alternative is
+/// silent loss: an actor that read a page minutes ago, reasoned about it, and
+/// writes back its conclusion will otherwise erase whatever landed in
+/// between — without either actor noticing. In a substrate where agents write
+/// unattended, "last writer wins" means "whoever is slowest is right".
+///
+/// The condition is evaluated **inside the writer lock**, immediately before
+/// the Git commit. Checking it in a handler would be worse than not checking:
+/// the gap between reading the current revision and writing is precisely
+/// where the lost update happens, so a check on the wrong side of the lock
+/// provides reassurance without protection.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum Precondition {
+    /// No condition; last writer wins. The historical behaviour, kept as the
+    /// default so existing clients — including `scripts/wikikiki-sync.sh` —
+    /// keep working unchanged.
+    #[default]
+    None,
+    /// The page must currently have this revision (`If-Match: "<rev>"`).
+    Revision(String),
+    /// The page must exist, whatever it says (`If-Match: *`).
+    Exists,
+    /// The page must not exist (`If-None-Match: *`). This is how a caller
+    /// creates a page without risking an overwrite.
+    Absent,
+}
+
+/// The state a precondition is evaluated against.
+///
+/// Three cases, not two: a row written outside this service can exist without
+/// a recorded revision, and a conditional write must fail there rather than
+/// guess.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CurrentState<'a> {
+    Absent,
+    Present(Option<&'a str>),
+}
+
+fn short_rev(rev: &str) -> &str {
+    &rev[..rev.len().min(12)]
+}
+
+impl Precondition {
+    fn check(&self, current: CurrentState<'_>) -> Result<()> {
+        let exists = matches!(current, CurrentState::Present(_));
+        match self {
+            Precondition::None => Ok(()),
+
+            Precondition::Exists if exists => Ok(()),
+            Precondition::Exists => {
+                Err(AppError::PreconditionFailed("page does not exist".into()))
+            }
+
+            Precondition::Absent if !exists => Ok(()),
+            Precondition::Absent => {
+                Err(AppError::PreconditionFailed("page already exists".into()))
+            }
+
+            Precondition::Revision(want) => match current {
+                CurrentState::Present(Some(have)) if want == have => Ok(()),
+                CurrentState::Present(Some(have)) => {
+                    Err(AppError::PreconditionFailed(format!(
+                        "page is at revision {}, expected {}",
+                        short_rev(have),
+                        short_rev(want)
+                    )))
+                }
+                // A row this service did not write has no revision to compare
+                // against. Refusing is the only honest answer: the caller
+                // asked to modify a specific version and we cannot tell which
+                // one is here.
+                CurrentState::Present(_) => Err(AppError::PreconditionFailed(
+                    "page has no recorded revision to compare against".into(),
+                )),
+                CurrentState::Absent => {
+                    Err(AppError::PreconditionFailed("page does not exist".into()))
+                }
+            },
+        }
+    }
 }
 
 /// Validate that `path` is a safe relative wiki path:
@@ -179,20 +273,44 @@ pub async fn recent(pool: &SqlitePool, limit: i64) -> Result<Vec<PageMeta>> {
     Ok(rows.into_iter().map(page_meta_from_row).collect())
 }
 
-/// Write (create or update) `page_path` with `content`. Performs the full
-/// disk → git → DB → FTS pipeline and returns the updated metadata.
+/// One page write, as a named record.
+///
+/// This was eleven positional parameters, of which `layer`, `actor_type`,
+/// `actor_handle` and `summary` are all strings — transposing two of them
+/// compiles cleanly and attributes an edit to the wrong actor or files it
+/// under the wrong memory layer. Naming the fields removes that class of
+/// mistake at no cost to the caller.
+#[derive(Debug, Clone)]
+pub struct WriteRequest<'a> {
+    pub path: &'a str,
+    pub layer: &'a str,
+    pub content: &'a str,
+    pub actor_id: i64,
+    pub actor_type: &'a str,
+    pub actor_handle: &'a str,
+    pub summary: Option<&'a str>,
+    /// Checked under the writer lock; see [`Precondition`].
+    pub precondition: Precondition,
+}
+
+/// Write (create or update) a page. Performs the full disk → git → DB → FTS
+/// pipeline and returns the updated metadata.
 pub async fn write(
     pool: &SqlitePool,
     repo: &Repo,
     content_root: &Path,
-    page_path: &str,
-    layer: &str,
-    content: &str,
-    actor_id: i64,
-    actor_type: &str,
-    actor_handle: &str,
-    summary: Option<&str>,
+    req: WriteRequest<'_>,
 ) -> Result<PageMeta> {
+    let WriteRequest {
+        path: page_path,
+        layer,
+        content,
+        actor_id,
+        actor_type,
+        actor_handle,
+        summary,
+        precondition,
+    } = req;
     validate_path(page_path)?;
 
     // A cancelled request may stop waiting, but must not abandon the database
@@ -211,8 +329,20 @@ pub async fn write(
 
     tokio::spawn(async move {
         let result = write_serialized(
-            &pool, &repo, &writer, &content_root, &page_path, &layer, &content,
-            actor_id, &actor_type, &actor_handle, summary.as_deref(),
+            &pool,
+            &repo,
+            &writer,
+            &content_root,
+            WriteRequest {
+                path: &page_path,
+                layer: &layer,
+                content: &content,
+                actor_id,
+                actor_type: &actor_type,
+                actor_handle: &actor_handle,
+                summary: summary.as_deref(),
+                precondition,
+            },
         )
         .await;
         if let Err(error) = &result {
@@ -229,14 +359,18 @@ async fn write_serialized(
     repo: &Repo,
     writer: &WriteSession,
     content_root: &Path,
-    page_path: &str,
-    layer: &str,
-    content: &str,
-    actor_id: i64,
-    actor_type: &str,
-    actor_handle: &str,
-    summary: Option<&str>,
+    req: WriteRequest<'_>,
 ) -> Result<PageMeta> {
+    let WriteRequest {
+        path: page_path,
+        layer,
+        content,
+        actor_id,
+        actor_type,
+        actor_handle,
+        summary,
+        precondition,
+    } = req;
     // Reject invalid input before changing any content or history. The actor
     // ID used by SQLite and the identity written into Git must describe the
     // same active actor, even when this service is called outside HTTP.
@@ -255,6 +389,21 @@ async fn write_serialized(
     if !actor.is_active || actor.actor_type != actor_type || actor.handle != actor_handle {
         return Err(AppError::Forbidden);
     }
+
+    // Evaluate the precondition here, not in the handler: the writer lock is
+    // already held, so nothing can change the page between this read and the
+    // commit below. That ordering is the entire guarantee — the same check
+    // one layer up would be a race with a reassuring name.
+    let existing_row: Option<(Option<String>,)> =
+        sqlx::query_as("SELECT content_hash FROM pages WHERE path = ?")
+            .bind(page_path)
+            .fetch_optional(pool)
+            .await?;
+    let current = match &existing_row {
+        Some((hash,)) => CurrentState::Present(hash.as_deref()),
+        None => CurrentState::Absent,
+    };
+    precondition.check(current)?;
 
     // The caller retains this write session through the SQLite commit, so
     // the database cannot project successful Git writes in reverse order.
@@ -364,6 +513,7 @@ async fn write_serialized(
         last_edit_by: Some(actor_id),
         last_edit_handle: Some(actor_handle.to_string()),
         last_edit_type: Some(actor_type.to_string()),
+        revision: Some(hash),
     })
 }
 
@@ -491,6 +641,88 @@ mod tests {
             relative_file_path("a/b/c"),
             PathBuf::from("a").join("b").join("c.md")
         );
+    }
+
+    fn present(rev: &str) -> CurrentState<'_> {
+        CurrentState::Present(Some(rev))
+    }
+
+    #[test]
+    fn no_precondition_accepts_anything() {
+        let p = Precondition::None;
+        assert!(p.check(CurrentState::Absent).is_ok());
+        assert!(p.check(present("abc")).is_ok());
+        assert!(p.check(CurrentState::Present(None)).is_ok());
+    }
+
+    #[test]
+    fn matching_revision_is_accepted_and_a_stale_one_is_not() {
+        let p = Precondition::Revision("abc123".into());
+        assert!(p.check(present("abc123")).is_ok());
+        assert!(matches!(
+            p.check(present("def456")),
+            Err(AppError::PreconditionFailed(_))
+        ));
+    }
+
+    /// The error has to name both revisions. "Precondition failed" alone
+    /// leaves a writer unable to tell a stale edit from a wrong path.
+    #[test]
+    fn stale_revision_error_names_both_sides() {
+        let p = Precondition::Revision("aaaaaaaaaaaaaaaa".into());
+        let Err(AppError::PreconditionFailed(msg)) = p.check(present("bbbbbbbbbbbbbbbb")) else {
+            panic!("expected a precondition failure");
+        };
+        assert!(msg.contains("aaaaaaaaaaaa"), "{msg}");
+        assert!(msg.contains("bbbbbbbbbbbb"), "{msg}");
+    }
+
+    #[test]
+    fn revision_check_fails_on_a_missing_page() {
+        let p = Precondition::Revision("abc".into());
+        assert!(matches!(
+            p.check(CurrentState::Absent),
+            Err(AppError::PreconditionFailed(_))
+        ));
+    }
+
+    /// A row written outside this service has no revision to compare against.
+    /// Guessing either way would be worse than refusing.
+    #[test]
+    fn revision_check_fails_when_the_page_has_no_recorded_revision() {
+        let p = Precondition::Revision("abc".into());
+        assert!(matches!(
+            p.check(CurrentState::Present(None)),
+            Err(AppError::PreconditionFailed(_))
+        ));
+    }
+
+    #[test]
+    fn exists_and_absent_are_mirror_images() {
+        assert!(Precondition::Exists.check(present("x")).is_ok());
+        assert!(Precondition::Exists.check(CurrentState::Present(None)).is_ok());
+        assert!(matches!(
+            Precondition::Exists.check(CurrentState::Absent),
+            Err(AppError::PreconditionFailed(_))
+        ));
+
+        assert!(Precondition::Absent.check(CurrentState::Absent).is_ok());
+        assert!(matches!(
+            Precondition::Absent.check(present("x")),
+            Err(AppError::PreconditionFailed(_))
+        ));
+    }
+
+    #[test]
+    fn default_precondition_preserves_the_historical_behaviour() {
+        assert_eq!(Precondition::default(), Precondition::None);
+    }
+
+    #[test]
+    fn short_rev_does_not_panic_on_short_input() {
+        assert_eq!(short_rev("abc"), "abc");
+        assert_eq!(short_rev(""), "");
+        assert_eq!(short_rev("0123456789abcdef"), "0123456789ab");
     }
 
     #[test]

@@ -297,3 +297,212 @@ async fn revoked_actor_blocked() {
 // Keeps the unused-import lint quiet on platforms without certain reqwest features.
 #[allow(dead_code)]
 fn _path_witness(_: PathBuf) {}
+
+// ===========================================================================
+// Conditional writes
+//
+// The property under test is that an actor cannot erase a change it never
+// saw. Everything else here — ETag plumbing, 412 codes — exists to serve it.
+// ===========================================================================
+
+/// Bootstrap an admin and mint an agent token in one step.
+async fn agent_token(h: &Harness, admin: &str, agent: &str) -> String {
+    let admin_id = bootstrap_admin(&h.pool, admin, None, "passwordpassword")
+        .await
+        .expect("bootstrap");
+    let (_, token) = issue_actor_token(&h.pool, agent, "agent", None, None, None, admin_id)
+        .await
+        .expect("issue");
+    token
+}
+
+fn etag_of(resp: &reqwest::Response) -> String {
+    resp.headers()
+        .get(reqwest::header::ETAG)
+        .expect("response carries an ETag")
+        .to_str()
+        .expect("ascii etag")
+        .to_string()
+}
+
+#[tokio::test]
+async fn get_exposes_a_revision_that_a_conditional_write_accepts() {
+    let h = spawn().await;
+    let token = agent_token(&h, "admin1", "writer1").await;
+    let url = format!("{}/api/pages/conditional", h.base);
+    let cli = client();
+
+    cli.put(&url)
+        .bearer_auth(&token)
+        .body("# One\n\nfirst\n")
+        .send()
+        .await
+        .unwrap();
+
+    let get = cli.get(&url).send().await.unwrap();
+    let etag = etag_of(&get);
+    assert!(etag.starts_with('"') && etag.ends_with('"'), "{etag}");
+
+    // The revision just read is the one a write may name.
+    let ok = cli
+        .put(&url)
+        .bearer_auth(&token)
+        .header("If-Match", &etag)
+        .body("# Two\n\nsecond\n")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(ok.status().as_u16(), 200, "matching If-Match must succeed");
+
+    // ...and it is stale immediately afterwards.
+    let stale = cli
+        .put(&url)
+        .bearer_auth(&token)
+        .header("If-Match", &etag)
+        .body("# Three\n\nthird\n")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(stale.status().as_u16(), 412, "stale If-Match must be refused");
+
+    // The refused write changed nothing.
+    let body = cli.get(&url).send().await.unwrap().text().await.unwrap();
+    assert!(body.contains("second"), "refused write must not land: {body}");
+    assert!(!body.contains("third"));
+}
+
+#[tokio::test]
+async fn if_none_match_star_creates_without_overwriting() {
+    let h = spawn().await;
+    let token = agent_token(&h, "admin2", "writer2").await;
+    let url = format!("{}/api/pages/create-once", h.base);
+    let cli = client();
+
+    let created = cli
+        .put(&url)
+        .bearer_auth(&token)
+        .header("If-None-Match", "*")
+        .body("# Created\n\noriginal\n")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(created.status().as_u16(), 200);
+
+    let second = cli
+        .put(&url)
+        .bearer_auth(&token)
+        .header("If-None-Match", "*")
+        .body("# Clobbered\n\nreplacement\n")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(second.status().as_u16(), 412, "must not overwrite");
+
+    let body = cli.get(&url).send().await.unwrap().text().await.unwrap();
+    assert!(body.contains("original"), "{body}");
+}
+
+/// Existing clients — `scripts/wikikiki-sync.sh` among them — send no
+/// conditional headers and must keep working exactly as before.
+#[tokio::test]
+async fn writes_without_conditions_are_unaffected() {
+    let h = spawn().await;
+    let token = agent_token(&h, "admin3", "writer3").await;
+    let url = format!("{}/api/pages/unconditional", h.base);
+    let cli = client();
+
+    for body in ["# A\n\nfirst\n", "# B\n\nsecond\n", "# C\n\nthird\n"] {
+        let resp = cli
+            .put(&url)
+            .bearer_auth(&token)
+            .body(body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 200, "unconditional write must land");
+    }
+
+    let body = cli.get(&url).send().await.unwrap().text().await.unwrap();
+    assert!(body.contains("third"), "{body}");
+}
+
+#[tokio::test]
+async fn malformed_conditional_headers_are_rejected_rather_than_ignored() {
+    let h = spawn().await;
+    let token = agent_token(&h, "admin4", "writer4").await;
+    let url = format!("{}/api/pages/malformed", h.base);
+    let cli = client();
+
+    // Silently ignoring these would drop a guarantee the caller asked for.
+    let cases: [(&str, &str); 3] = [
+        ("If-Match", "not-a-quoted-tag"),
+        ("If-Match", "\"aaa\", \"bbb\""),
+        ("If-None-Match", "\"some-tag\""),
+    ];
+    for (name, value) in cases {
+        let resp = cli
+            .put(&url)
+            .bearer_auth(&token)
+            .header(name, value)
+            .body("x")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status().as_u16(),
+            400,
+            "{name}: {value} should be a bad request"
+        );
+    }
+}
+
+/// The point of the whole feature: several actors read the same revision,
+/// then all write back. Exactly one may win, and the rest must be told.
+#[tokio::test]
+async fn concurrent_writers_sharing_a_base_revision_produce_exactly_one_winner() {
+    let h = spawn().await;
+    let token = agent_token(&h, "admin5", "writer5").await;
+    let url = format!("{}/api/pages/contested", h.base);
+    let cli = client();
+
+    cli.put(&url)
+        .bearer_auth(&token)
+        .body("# Base\n\nbase\n")
+        .send()
+        .await
+        .unwrap();
+    let base = etag_of(&cli.get(&url).send().await.unwrap());
+
+    let mut tasks = Vec::new();
+    for i in 0..8 {
+        let (cli, url, token, base) = (cli.clone(), url.clone(), token.clone(), base.clone());
+        tasks.push(tokio::spawn(async move {
+            cli.put(&url)
+                .bearer_auth(&token)
+                .header("If-Match", &base)
+                .body(format!("# Writer {i}\n\nbody from writer {i}\n"))
+                .send()
+                .await
+                .unwrap()
+                .status()
+                .as_u16()
+        }));
+    }
+
+    let mut statuses = Vec::new();
+    for t in tasks {
+        statuses.push(t.await.expect("join"));
+    }
+
+    let winners = statuses.iter().filter(|s| **s == 200).count();
+    let refused = statuses.iter().filter(|s| **s == 412).count();
+    assert_eq!(winners, 1, "exactly one writer may win: {statuses:?}");
+    assert_eq!(refused, 7, "every loser must be told: {statuses:?}");
+
+    // And the surviving page is one writer's work, not a blend.
+    let body = cli.get(&url).send().await.unwrap().text().await.unwrap();
+    let mentions = (0..8)
+        .filter(|i| body.contains(&format!("body from writer {i}")))
+        .count();
+    assert_eq!(mentions, 1, "page must hold exactly one writer's text: {body}");
+}

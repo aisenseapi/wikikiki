@@ -309,19 +309,43 @@ pub fn view_page(auth: Option<&Auth>, page: &Page) -> Markup {
     layout(&page.meta.title, auth, body)
 }
 
+/// The markdown editor.
+///
+/// `conflict` carries the reason a previous save was refused. When it is set,
+/// `content` is what the writer submitted and `meta` is the page as it stands
+/// *now* — so the form comes back holding their work, against the current
+/// revision. Saving again then overwrites knowingly, which is a different act
+/// from overwriting without being told.
 pub fn edit_page(
     auth: Option<&Auth>,
     page_path: &str,
     content: &str,
     meta: Option<&PageMeta>,
+    conflict: Option<&str>,
 ) -> Markup {
     let title = meta
         .map(|m| m.title.clone())
         .unwrap_or_else(|| page_path.to_string());
     let layer = meta.map(|m| m.layer.as_str()).unwrap_or("semantic");
+    let revision = meta.and_then(|m| m.revision.as_deref()).unwrap_or("");
     let post_url = wiki_url(page_path);
+    let view_url = wiki_url(page_path);
     let is_new = meta.is_none();
     let body = html! {
+        @if let Some(reason) = conflict {
+            div."alert alert--warn" role="alert" {
+                strong { "This page changed while you were editing." }
+                " " (reason) "."
+                p."alert__detail" {
+                    "Your text is still below, and the form now points at the \
+                     current version. "
+                    a href=(view_url) target="_blank" rel="noopener" {
+                        "Open the current page in a new tab"
+                    }
+                    " to compare before saving over it."
+                }
+            }
+        }
         form."editor" method="post" action=(post_url) {
             header."editor__head" {
                 div."editor__ident" {
@@ -336,6 +360,9 @@ pub fn edit_page(
             }
 
             input type="hidden" name="layer" value=(layer);
+            // Empty for a page that does not exist yet, which the handler
+            // reads as "must still not exist".
+            input type="hidden" name="revision" value=(revision);
 
             label."field" {
                 span."field__label" { "Summary" }
@@ -1046,6 +1073,12 @@ mark { background: var(--mark-bg); color: var(--mark-fg); padding: 0 .15em; bord
 }
 .alert--error { background: var(--danger-bg); color: var(--danger-fg);
   border-color: var(--danger-border); }
+.alert--warn {
+  background: color-mix(in srgb, var(--actor-human) 12%, transparent);
+  color: var(--fg);
+  border-color: color-mix(in srgb, var(--actor-human) 40%, transparent);
+}
+.alert__detail { margin: .4rem 0 0; font-size: .88rem; color: var(--fg-muted); }
 
 /* --------------------------------------------------------------------------
    Narrow screens
