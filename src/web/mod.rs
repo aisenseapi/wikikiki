@@ -60,6 +60,7 @@ impl AppState {
 pub fn router(state: AppState) -> Router {
     let api = Router::new()
         .route("/api/pages/*path", get(api_get_page).put(api_put_page))
+        .route("/api/impact/*path", get(api_impact))
         .route("/api/search", get(api_search));
 
     let ui = Router::new()
@@ -68,6 +69,7 @@ pub fn router(state: AppState) -> Router {
         .route("/logout", post(logout))
         .route("/wiki/*path", get(view_page).post(save_page))
         .route("/wiki-history/*path", get(history_page))
+        .route("/wiki-impact/*path", get(impact_page))
         .route("/wiki-revision/*path", get(revision_page))
         .route("/search", get(search_page))
         .route("/me", get(me_page))
@@ -459,6 +461,11 @@ async fn view_page(
     require_read(&state, auth)?;
 
     let page = pages::read(&state.pool, &state.config.paths.content_root, &path).await;
+    // Opening the editor is a read too: the text in the textarea is what the
+    // writer is about to build on.
+    if let Ok(p) = &page {
+        record_read_for(&state, auth, p).await;
+    }
 
     if q.edit == Some(1) {
         // Edit view — require write.
@@ -609,6 +616,17 @@ async fn history_page(
     ))
 }
 
+async fn impact_page(
+    State(state): State<AppState>,
+    Path(path): Path<String>,
+    req: Request,
+) -> Result<Html<String>> {
+    let auth = current_auth(req.extensions());
+    require_read(&state, auth)?;
+    let impact = pages::impact(&state.pool, &path).await?;
+    Ok(Html(templates::impact(auth, &impact).into_string()))
+}
+
 #[derive(Deserialize)]
 struct RevisionQuery {
     commit: String,
@@ -686,6 +704,7 @@ async fn api_get_page(
     let auth = current_auth(req.extensions());
     require_read(&state, auth)?;
     let page = pages::read(&state.pool, &state.config.paths.content_root, &path).await?;
+    record_read_for(&state, auth, &page).await;
     let wants_json = headers
         .get(header::ACCEPT)
         .and_then(|v| v.to_str().ok())
@@ -779,6 +798,31 @@ async fn api_put_page(
     Ok(resp)
 }
 
+/// Readers of older revisions and their later writes, as JSON. Inspecting the
+/// impact list is not itself a read of the page, so nothing is recorded here.
+async fn api_impact(
+    State(state): State<AppState>,
+    Path(path): Path<String>,
+    req: Request,
+) -> Result<Response> {
+    let auth = current_auth(req.extensions());
+    require_read(&state, auth)?;
+    let impact = pages::impact(&state.pool, &path).await?;
+    let current_only: Vec<_> = impact
+        .current_only
+        .iter()
+        .map(|(handle, actor_type)| serde_json::json!({ "handle": handle, "type": actor_type }))
+        .collect();
+    Ok(axum::Json(serde_json::json!({
+        "path": impact.page.path,
+        "revision": impact.page.revision,
+        "readers": impact.readers,
+        "current_only": current_only,
+        "later_writes_limit": pages::LATER_WRITES_LIMIT,
+    }))
+    .into_response())
+}
+
 #[derive(Deserialize)]
 struct ApiSearch {
     q: String,
@@ -810,6 +854,21 @@ async fn api_search(
 // =========================================================================
 // Helpers
 // =========================================================================
+
+/// Record a served page for the requesting actor. Anonymous readers have no
+/// identity to attribute the read to, so they leave no row.
+async fn record_read_for(state: &AppState, auth: Option<&Auth>, page: &pages::Page) {
+    if let Some(a) = auth {
+        pages::record_read(
+            &state.pool,
+            page.meta.id,
+            a.actor.id,
+            page.meta.revision.as_deref(),
+            a.surface.as_str(),
+        )
+        .await;
+    }
+}
 
 /// A page's revision as an HTTP entity tag.
 ///

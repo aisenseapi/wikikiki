@@ -18,7 +18,11 @@ The application has a browser editor, named actors, token and session login,
 Markdown pages, Git history, revision checks, FTS search and task templates.
 The current improvement batch adds recoverable page writes, portable path
 validation, transactional credential administration, private defaults,
-self-hosting packaging and conditional sync clients.
+self-hosting packaging and conditional sync clients. It also records every
+authenticated page read with its revision and shows, per changed page, who
+read an earlier version and what they wrote before reading the current one.
+That list is the first observed-read slice of the 0 to 1 experiment, with
+precision and recall still to be measured.
 
 The regression suite and local verification establish specific behavior.
 An external deployment, independent security review and successful pilot are

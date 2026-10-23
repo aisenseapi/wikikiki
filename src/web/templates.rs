@@ -26,7 +26,7 @@ use maud::{html, Markup, PreEscaped, DOCTYPE};
 use crate::auth::Auth;
 use crate::db::queries::Actor;
 use crate::git::CommitInfo;
-use crate::pages::{Page, PageMeta, SearchHit};
+use crate::pages::{Impact, Page, PageMeta, SearchHit, LATER_WRITES_LIMIT};
 
 /// Render an FTS5 snippet, turning match sentinels into `<mark>` and escaping
 /// everything else.
@@ -194,6 +194,10 @@ fn wiki_history_url(path: &str) -> String {
     format!("/wiki-history/{path}")
 }
 
+fn wiki_impact_url(path: &str) -> String {
+    format!("/wiki-impact/{path}")
+}
+
 // ---------------------------------------------------------------------------
 // Views
 // ---------------------------------------------------------------------------
@@ -334,7 +338,7 @@ pub fn guide(auth: Option<&Auth>) -> Markup {
                     li { "Update the checkpoint before stopping. Include a short change summary." }
                 }
                 h2 { "Correct shared knowledge" }
-                p { "Explain what changed and link to the evidence. Update other pages that repeat the old claim. Readers must refresh their pages: automatic notifications and dependency updates are not available yet." }
+                p { "Explain what changed and link to the evidence. Then open the page's Affected work view: it lists who read the earlier version and which pages they wrote before reading the new one, so you can check those first. The list is inferred from timing, not from declared dependencies. Readers must still refresh their pages: automatic notifications are not available yet." }
                 h2 { "When edits overlap" }
                 p { "The editor checks the revision you opened. If another writer saves first, your text is kept in the response. Compare it with the current page before saving again." }
                 h2 { "Connect an agent" }
@@ -352,6 +356,7 @@ pub fn guide(auth: Option<&Auth>) -> Markup {
 pub fn view_page(auth: Option<&Auth>, page: &Page) -> Markup {
     let edit_url = wiki_edit_url(&page.meta.path);
     let history_url = wiki_history_url(&page.meta.path);
+    let impact_url = wiki_impact_url(&page.meta.path);
     let source_url = wiki_source_url(&page.meta.path);
     let body = html! {
         article."page" {
@@ -367,6 +372,7 @@ pub fn view_page(auth: Option<&Auth>, page: &Page) -> Markup {
                         a."btn btn--sm" href=(edit_url) { "Edit" }
                     }
                     a."btn btn--ghost btn--sm" href=(history_url) { "History" }
+                    a."btn btn--ghost btn--sm" href=(impact_url) { "Affected work" }
                     a."btn btn--ghost btn--sm" href=(source_url) { "Source" }
                 }
             }
@@ -516,6 +522,126 @@ pub fn history(
         }
     };
     layout("History", auth, body)
+}
+
+/// Who read an older revision of a page, and what they wrote afterwards.
+///
+/// The list is deliberately plain: an actor, whether it has seen the current
+/// text, and the pages it touched in between. The limits of the inference are
+/// stated on the page itself rather than in a tooltip, because a reader who
+/// takes this list as proof of dependency would be misled by it.
+pub fn impact(auth: Option<&Auth>, impact: &Impact) -> Markup {
+    let path = &impact.page.path;
+    let not_caught_up = impact
+        .readers
+        .iter()
+        .filter(|r| r.caught_up_at.is_none())
+        .count();
+    let body = html! {
+        header."page__head" {
+            div."page__crumbs" {
+                a."back" href=(wiki_url(path)) { "← " (impact.page.title) }
+            }
+            h1."page__title" { "Affected work" }
+            span."path" { (path) }
+            div."page__byline" { (attribution(&impact.page)) }
+            p."hint" {
+                "Actors below read an earlier version of this page. Writes listed under each \
+                 happened after that read and before the actor read the current version, if it \
+                 has. This is inferred from timing: a listed page may not depend on this one, \
+                 and an unlisted page still might. Reads outside this service are not recorded."
+            }
+            div."page__actions" {
+                a."btn btn--ghost btn--sm" href=(wiki_history_url(path)) { "History" }
+            }
+        }
+
+        @if impact.readers.is_empty() {
+            div."empty" {
+                p."empty__title" { "No reader of an earlier version is recorded." }
+                p."empty__body" {
+                    @if impact.current_only.is_empty() {
+                        "No authenticated actor has read this page yet."
+                    } @else {
+                        (impact.current_only.len())
+                        @if impact.current_only.len() == 1 { " actor has" } @else { " actors have" }
+                        " only read the current version."
+                    }
+                }
+            }
+        } @else {
+            section."panel" {
+                div."panel__head" {
+                    h2."panel__title" { "Readers of an earlier version" }
+                    span."panel__count" {
+                        (not_caught_up)
+                        @if not_caught_up == 1 { " has" } @else { " have" }
+                        " not read the current version"
+                    }
+                }
+                ul."impact" {
+                    @for r in &impact.readers {
+                        li."impact__reader" {
+                            div."impact__who" {
+                                (actor_chip(&r.handle, Some(&r.actor_type)))
+                                @if let Some(at) = r.caught_up_at {
+                                    span."chip chip--semantic" { "read current" }
+                                    time datetime=(iso_time(at)) { (rel_time(at)) }
+                                } @else {
+                                    span."chip chip--working" { "not read current" }
+                                }
+                            }
+                            div."impact__meta" {
+                                "last read an earlier version "
+                                time datetime=(iso_time(r.last_old_read_at)) { (rel_time(r.last_old_read_at)) }
+                                @if let Some(rev) = r.last_old_revision.as_deref() {
+                                    span."dot-sep" aria-hidden="true" { "·" }
+                                    "revision " code."oid" { (short_oid(rev)) }
+                                }
+                                span."dot-sep" aria-hidden="true" { "·" }
+                                (r.reads) @if r.reads == 1 { " read" } @else { " reads" }
+                            }
+                            @if r.later_writes.is_empty() {
+                                p."impact__none" { "No other pages written in that window." }
+                            } @else {
+                                ul."impact__writes" {
+                                    @for w in &r.later_writes {
+                                        li."impact__write" {
+                                            a href=(wiki_url(&w.path)) { (w.title) }
+                                            span."path" { (w.path) }
+                                            span."impact__when" {
+                                                time datetime=(iso_time(w.created_at)) { (rel_time(w.created_at)) }
+                                                @if let Some(s) = w.summary.as_deref() {
+                                                    span."dot-sep" aria-hidden="true" { "·" }
+                                                    (s)
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                @if r.later_writes_total > LATER_WRITES_LIMIT {
+                                    p."impact__none" {
+                                        "Showing the newest " (LATER_WRITES_LIMIT) " of "
+                                        (r.later_writes_total) " writes."
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            @if !impact.current_only.is_empty() {
+                p."hint" {
+                    "Only read the current version: "
+                    @for (i, (handle, ty)) in impact.current_only.iter().enumerate() {
+                        @if i > 0 { ", " }
+                        (actor_chip(handle, Some(ty)))
+                    }
+                }
+            }
+        }
+    };
+    layout("Affected work", auth, body)
 }
 
 /// Git author lines are rendered from `git.author_template`, whose default is
@@ -1124,6 +1250,23 @@ mark { background: var(--mark-bg); color: var(--mark-fg); padding: 0 .15em; bord
 .timeline__meta { display: flex; align-items: center; gap: .45rem;
   flex-wrap: wrap; margin-top: .2rem; font-size: .8rem; color: var(--fg-subtle); }
 .oid { color: var(--fg-subtle); }
+
+/* --------------------------------------------------------------------------
+   Affected work
+   -------------------------------------------------------------------------- */
+.impact { list-style: none; margin: 0; padding: 0; }
+.impact__reader { padding: 1rem 0; border-bottom: 1px solid var(--border); }
+.impact__reader:last-child { border-bottom: 0; }
+.impact__who { display: flex; align-items: center; gap: .6rem; flex-wrap: wrap; }
+.impact__who time { font-size: .8rem; color: var(--fg-subtle); }
+.impact__meta { margin-top: .25rem; font-size: .8rem; color: var(--fg-subtle);
+  display: flex; align-items: center; gap: .4rem; flex-wrap: wrap; }
+.impact__writes { list-style: none; margin: .6rem 0 0; padding: 0 0 0 .9rem;
+  border-left: 2px solid var(--border-strong); }
+.impact__write { display: flex; flex-direction: column; gap: .05rem; padding: .35rem 0; }
+.impact__write a { font-weight: 540; }
+.impact__when { font-size: .8rem; color: var(--fg-subtle); }
+.impact__none { margin: .5rem 0 0; font-size: .85rem; color: var(--fg-subtle); }
 
 /* --------------------------------------------------------------------------
    Actor list + definition list

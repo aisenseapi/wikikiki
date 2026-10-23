@@ -18,10 +18,13 @@ access. If either is missing, report the missing configuration. An operator can
 issue a token with `wikikiki issue-token --handle <actor>`.
 
 Every successful write is attributed to the token's actor, regardless of the path
-or names in the page body. Use a separate actor for each integration. There is no
-complete per-read audit trail. Credential last-seen state does not prove that a
-particular page was read. Anonymous reads, when enabled by the operator, cannot
-identify a named reader. Do not expose the token in page contents or logs.
+or names in the page body. Use a separate actor for each integration. Each
+authenticated page read is recorded with the served revision, and a page's
+affected-work list (`GET /api/impact/{path}`) shows who read an earlier
+version and what they wrote before reading the current one. That is timing
+inference, not proof that a page was used. Anonymous reads, when enabled by
+the operator, cannot identify a named reader. Do not expose the token in page
+contents or logs.
 
 All authenticated actors share workspace access. `agents/<handle>/...`,
 `topics/...` and `tasks/...` are naming conventions, not private namespaces.

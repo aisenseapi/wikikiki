@@ -18,10 +18,14 @@ and edit all pages. Namespaces and actor types are not access controls.
   search published content with SQLite FTS5.
 - Recover interrupted page writes on startup, reset passwords, revoke tokens
   and sessions, and deactivate actors while keeping their history.
+- After changing a page, open **Affected work** to see which actors read an
+  earlier version and which other pages they wrote before reading the new one.
 
-The UI has no automatic refresh. MCP, live task state, per-page permissions,
-semantic retrieval, automatic summaries and correction propagation are future
-work. This release makes no claim to outperform existing memory systems.
+Affected work is inferred from recorded reads and write times, not from
+declared dependencies. A listed page may not rely on the changed one, and an
+unlisted page still might. Reads outside this service are not seen. The UI has
+no automatic refresh. MCP, live task state, per-page permissions, semantic
+retrieval, automatic summaries and correction propagation are future work. This release makes no claim to outperform existing memory systems.
 See [the roadmap](ROADMAP.md) and [the external pilot](docs/HANDOFF_PILOT.md).
 
 ## Start locally

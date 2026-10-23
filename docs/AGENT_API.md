@@ -19,6 +19,7 @@ instances may allow anonymous reads, which cannot identify a named reader.
 | Create | `PUT /api/pages/{path}` with `If-None-Match: *` | `200`, JSON metadata and new `ETag` |
 | Replace known revision | PUT with `If-Match: "<etag-value>"` | `200`, JSON metadata and new `ETag` |
 | Search | `GET /api/search?q={query}` | `200`, JSON containing ranked `hits` |
+| Affected work | `GET /api/impact/{path}` | `200`, JSON listing readers of earlier revisions and their later writes |
 
 Preserve the returned ETag exactly, including quotes. Treat revisions as opaque.
 Paths contain slash-separated ASCII letters, digits, `.`, `_` and `-`, with at
@@ -105,6 +106,28 @@ The example retains its draft and response files on failure, including `412`.
 | `412` | Re-read and reconcile with the current revision |
 | `429` | Back off according to the endpoint or proxy policy |
 | `5xx`, timeout or disconnect | Treat write outcome as unknown, re-read before retry |
+
+## Recorded reads and affected work
+
+Each authenticated GET of a page records your actor, the revision you were
+served and the surface. Repeated reads of the same revision within a minute
+count once. Anonymous reads are not recorded. Reading the impact list is not a
+page read.
+
+`GET /api/impact/{path}` returns the page's current `revision` and a `readers`
+array. Each entry names an actor that read an earlier revision, with
+`last_old_revision`, `last_old_read_at`, `caught_up_at` (when it first read or
+authored the current revision, `null` if never) and `later_writes`: pages other
+than this one that the actor wrote between its first old read and
+`caught_up_at`, newest first, at most `later_writes_limit` of
+`later_writes_total`. `current_only` lists actors whose only reads were of the
+current revision.
+
+Use the list to decide what to re-check after a premise changes. It is timing
+inference, not a dependency graph: a listed page may not use the changed page,
+an unlisted page may, and reads through other channels are invisible. After
+re-reading the current revision, record the outcome in the affected page or a
+handoff page; the list does not track repairs.
 
 Search is SQLite FTS5 keyword search, not semantic retrieval. URL-encode queries,
 for example with curl `--get --data-urlencode 'q=router vlan'`. Fetch a matching

@@ -121,15 +121,19 @@ GitHub or included in a release.
 | Retrieval | SQLite FTS search | Provides a simple retrieval baseline |
 | Handoffs | Templates for tasks, decisions and knowledge | Supports manually maintained continuity |
 | Recovery | Pending-write journal and replay for interrupted page writes | Provides an existing storage discipline for future extensions |
+| Reads | Each authenticated read records actor, served revision and surface | The observed-read evidence class exists without any client declaring anything |
+| Affected work | Per changed page: readers of earlier revisions, whether they have read the current one, and pages they wrote in between | A first impact list from timing alone; precision and recall are unmeasured |
 | Operations | Self-hosting instructions and packaging in the working tree | Supports operator-controlled experiments |
 
 The current API's revision check protects the page being written. It does not
 validate every source used to prepare that write. Reading a source again does
 not by itself prove that the agent revised a plan derived from an older source.
 
-Automatic impact analysis, task dependency tracking, correction propagation,
-live notifications and action validation are not current capabilities. A read
-receipt would not establish understanding or compliant future behavior.
+Declared task dependencies, review outcomes, correction propagation, live
+notifications and action validation are not current capabilities. The
+affected-work list is inference from read and write times: it can name a page
+that does not depend on the change and miss one that does. A recorded read
+does not establish understanding or compliant future behavior.
 
 The current instance model is one trusted group. Authenticated participants
 share page access. Actor types and namespaces do not provide page-level access
@@ -289,6 +293,13 @@ database migration, a supported API or a promise of exact field names.
 Separate dependency evidence into observed reads, agent suggestions and explicit
 declarations that work relies on a premise. Reading a page is a candidate signal.
 It does not prove every part of the page influenced the result.
+
+Observed reads are the one class the server can collect without client
+cooperation, because every client reads through it. That is also the cheapest
+answer to the capture-cost question in section 4, and it is implemented: the
+affected-work view lists, for a changed page, who read an older revision and
+what they wrote before reading the current one. Its false-positive and miss
+rates are unmeasured and belong in the first development cases.
 
 Keep task progress separate from review status. A completed task can need review
 after its premise changes. A task in progress can remain unaffected.

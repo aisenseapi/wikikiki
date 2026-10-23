@@ -294,6 +294,223 @@ pub async fn read(pool: &SqlitePool, content_root: &Path, page_path: &str) -> Re
     Ok(Page { meta, content })
 }
 
+/// Repeated reads of the same revision by the same actor within this window
+/// collapse into one row. A client that re-fetches a page every few seconds
+/// would otherwise fill the table without adding evidence: the first and
+/// last read of a revision are what the impact view needs, and both survive
+/// this at minute resolution.
+const READ_COALESCE_SECS: i64 = 60;
+
+/// Record that `actor_id` was served `revision` of a page.
+///
+/// Failure is logged and swallowed, like `auth::log_access`: a page read must
+/// not fail because its evidence row could not be written. The insert runs on
+/// the pool, outside the repository writer lock, so it cannot delay a write.
+pub async fn record_read(
+    pool: &SqlitePool,
+    page_id: i64,
+    actor_id: i64,
+    revision: Option<&str>,
+    surface: &str,
+) {
+    let now = crate::db::now_ts();
+    let res = sqlx::query(
+        "INSERT INTO page_reads(page_id, actor_id, revision, surface, created_at)
+         SELECT ?, ?, ?, ?, ?
+         WHERE NOT EXISTS (
+             SELECT 1 FROM page_reads
+             WHERE page_id = ? AND actor_id = ? AND revision IS ? AND created_at > ?
+         )",
+    )
+    .bind(page_id)
+    .bind(actor_id)
+    .bind(revision)
+    .bind(surface)
+    .bind(now)
+    .bind(page_id)
+    .bind(actor_id)
+    .bind(revision)
+    .bind(now - READ_COALESCE_SECS)
+    .execute(pool)
+    .await;
+    if let Err(e) = res {
+        tracing::warn!(error = %e, page_id, actor_id, "page_reads insert failed");
+    }
+}
+
+/// A page another actor wrote after reading an older revision of the
+/// inspected page, and before (if ever) reading its current revision.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct LaterWrite {
+    pub path: String,
+    pub title: String,
+    pub created_at: i64,
+    pub summary: Option<String>,
+    pub revision: Option<String>,
+}
+
+/// One actor's relationship to the inspected page's current revision.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ImpactReader {
+    pub actor_id: i64,
+    pub handle: String,
+    pub actor_type: String,
+    /// First time this actor read a revision other than the current one.
+    pub first_old_read_at: i64,
+    /// Most recent read of a non-current revision, and which revision it was.
+    pub last_old_read_at: i64,
+    pub last_old_revision: Option<String>,
+    /// When the actor first read, or authored, the current revision. `None`
+    /// means it has not seen the current text through this service.
+    pub caught_up_at: Option<i64>,
+    pub reads: i64,
+    /// Writes to other pages between the first old read and `caught_up_at`,
+    /// newest first, capped at [`LATER_WRITES_LIMIT`].
+    pub later_writes: Vec<LaterWrite>,
+    pub later_writes_total: i64,
+}
+
+pub const LATER_WRITES_LIMIT: i64 = 20;
+
+#[derive(Debug, Clone)]
+pub struct Impact {
+    pub page: PageMeta,
+    /// Readers that have seen an older revision, those not caught up first.
+    pub readers: Vec<ImpactReader>,
+    /// Actors whose only reads were of the current revision.
+    pub current_only: Vec<(String, String)>,
+}
+
+/// Who read an older revision of `page_path`, and what they wrote afterwards.
+///
+/// This is inference from timing, not a dependency record. A write that falls
+/// inside the window may have nothing to do with the page; a write outside it
+/// may still rely on it. The view exists so a person can inspect candidates
+/// without reading every agent's conversation, and the limits are stated
+/// where the data is shown.
+pub async fn impact(pool: &SqlitePool, page_path: &str) -> Result<Impact> {
+    let page = read_meta(pool, page_path)
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("page {page_path}")))?;
+
+    type ReaderRow = (
+        i64,
+        String,
+        String,
+        Option<i64>,
+        Option<i64>,
+        Option<String>,
+        Option<i64>,
+        Option<i64>,
+        i64,
+    );
+    // `IS NOT` is NULL-safe in SQLite, so a legacy read without a revision
+    // counts as old rather than vanishing from both buckets.
+    let rows = sqlx::query_as::<_, ReaderRow>(
+        "SELECT a.id, a.handle, a.type,
+                MIN(CASE WHEN r.revision IS NOT ?2 THEN r.created_at END) AS first_old,
+                MAX(CASE WHEN r.revision IS NOT ?2 THEN r.created_at END) AS last_old,
+                (SELECT r2.revision FROM page_reads r2
+                  WHERE r2.page_id = ?1 AND r2.actor_id = a.id AND r2.revision IS NOT ?2
+                  ORDER BY r2.created_at DESC, r2.id DESC LIMIT 1) AS last_old_revision,
+                MIN(CASE WHEN r.revision IS ?2 THEN r.created_at END) AS first_current,
+                (SELECT MIN(e.created_at) FROM page_edits e
+                  WHERE e.page_id = ?1 AND e.actor_id = a.id AND e.operation_id IS ?2) AS authored_current,
+                COUNT(*) AS reads
+         FROM page_reads r JOIN actors a ON a.id = r.actor_id
+         WHERE r.page_id = ?1
+         GROUP BY a.id
+         ORDER BY last_old DESC",
+    )
+    .bind(page.id)
+    .bind(page.revision.as_deref())
+    .fetch_all(pool)
+    .await?;
+
+    let mut readers = Vec::new();
+    let mut current_only = Vec::new();
+    for (
+        actor_id,
+        handle,
+        actor_type,
+        first_old,
+        last_old,
+        last_old_revision,
+        first_current,
+        authored_current,
+        reads,
+    ) in rows
+    {
+        let (Some(first_old_read_at), Some(last_old_read_at)) = (first_old, last_old) else {
+            current_only.push((handle, actor_type));
+            continue;
+        };
+        let caught_up_at = match (first_current, authored_current) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        let later_writes =
+            sqlx::query_as::<_, (String, String, i64, Option<String>, Option<String>)>(
+                "SELECT p.path, p.title, e.created_at, e.summary, e.operation_id
+             FROM page_edits e JOIN pages p ON p.id = e.page_id
+             WHERE e.actor_id = ?1 AND e.page_id != ?2 AND e.created_at >= ?3
+               AND (?4 IS NULL OR e.created_at < ?4)
+             ORDER BY e.created_at DESC, e.id DESC LIMIT ?5",
+            )
+            .bind(actor_id)
+            .bind(page.id)
+            .bind(first_old_read_at)
+            .bind(caught_up_at)
+            .bind(LATER_WRITES_LIMIT)
+            .fetch_all(pool)
+            .await?;
+        let later_writes_total: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM page_edits e
+             WHERE e.actor_id = ?1 AND e.page_id != ?2 AND e.created_at >= ?3
+               AND (?4 IS NULL OR e.created_at < ?4)",
+        )
+        .bind(actor_id)
+        .bind(page.id)
+        .bind(first_old_read_at)
+        .bind(caught_up_at)
+        .fetch_one(pool)
+        .await?;
+        readers.push(ImpactReader {
+            actor_id,
+            handle,
+            actor_type,
+            first_old_read_at,
+            last_old_read_at,
+            last_old_revision,
+            caught_up_at,
+            reads,
+            later_writes: later_writes
+                .into_iter()
+                .map(|(path, title, created_at, summary, revision)| LaterWrite {
+                    path,
+                    title,
+                    created_at,
+                    summary,
+                    revision,
+                })
+                .collect(),
+            later_writes_total,
+        });
+    }
+    // Not caught up first; within each group, most recent old read first.
+    readers.sort_by_key(|r| {
+        (
+            r.caught_up_at.is_some(),
+            std::cmp::Reverse(r.last_old_read_at),
+        )
+    });
+    Ok(Impact {
+        page,
+        readers,
+        current_only,
+    })
+}
+
 pub async fn read_meta(pool: &SqlitePool, page_path: &str) -> Result<Option<PageMeta>> {
     validate_path(page_path)?;
     let sql = format!(

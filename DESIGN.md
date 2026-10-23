@@ -49,10 +49,21 @@ SQLite snapshot. Legacy file-backed rows validate the file hash before use.
 Case aliases and unsafe portable paths are rejected without renaming existing
 content. Direct filesystem edits are not an import interface.
 
-The UI provides page creation templates, editing, named authors, history and
-search. It does not receive live updates. Browser conflicts retain the draft
-in the response. FTS is lexical search. L1 working memory, state machines, MCP,
-distillation, dependency propagation and per-resource visibility remain proposals.
+Every authenticated page read records the actor, the served revision and the
+surface in `page_reads`. Repeated reads of one revision by one actor within a
+minute collapse into one row. Anonymous reads and reads outside this service
+leave no record. The affected-work view and `GET /api/impact/{path}` list, per
+actor that read an earlier revision, whether it has since read or authored the
+current one and which other pages it wrote in between. That is timing
+inference over recorded reads and edits, not a dependency record, and the view
+says so. Impact rows are derived from `page_reads` and `page_edits`; backups
+must include both tables with the rest of the database.
+
+The UI provides page creation templates, editing, named authors, history,
+search and the affected-work view. It does not receive live updates. Browser
+conflicts retain the draft in the response. FTS is lexical search. L1 working
+memory, state machines, MCP, distillation, declared dependencies, correction
+propagation and per-resource visibility remain proposals.
 
 See ROADMAP.md for the delivery order and docs/SELF_HOSTING.md for operations.
 

@@ -14,7 +14,10 @@ Use existing pages, actor attribution, history, and REST calls. Task checkpoints
 are ordinary Markdown pages. They use the existing page API.
 
 Clients must refresh pages manually. There are no automatic change notifications,
-correction propagation or source dependency checks. PUT replaces the whole page.
+correction propagation or declared source dependency checks. A page's
+affected-work view lists who read an earlier version and what they wrote
+before reading the current one, inferred from timing only. PUT replaces the
+whole page.
 GET returns an ETag. Updates must send it in If-Match and reconcile a 412 response.
 New pages use If-None-Match: *. A GET immediately before an unconditional PUT does
 not prevent races. Page namespaces are organizational, not access controls.
