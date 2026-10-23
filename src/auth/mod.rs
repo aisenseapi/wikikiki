@@ -9,7 +9,7 @@ pub mod hash;
 pub mod session;
 pub mod token;
 
-use sqlx::SqlitePool;
+use sqlx::{Executor, Sqlite, SqlitePool};
 
 use crate::db::queries::Actor;
 use crate::error::Result;
@@ -67,16 +67,20 @@ pub async fn log_access(
     }
 }
 
-/// Log an admin_audit entry. Same fail-soft policy as `log_access`.
-pub async fn log_admin(
-    pool: &SqlitePool,
+/// Log an admin action. Mutation callers pass their transaction so an audit
+/// failure rolls the action back instead of leaving an unaudited change.
+pub async fn log_admin<'e, E>(
+    executor: E,
     actor_id: i64,
     target: &str,
     operation: &str,
     before_value: Option<&str>,
     after_value: Option<&str>,
     note: Option<&str>,
-) -> Result<()> {
+) -> Result<()>
+where
+    E: Executor<'e, Database = Sqlite>,
+{
     sqlx::query(
         "INSERT INTO admin_audit(actor_id, target, operation, before_value, after_value, note, created_at)
          VALUES (?, ?, ?, ?, ?, ?, ?)",
@@ -88,7 +92,7 @@ pub async fn log_admin(
     .bind(after_value)
     .bind(note)
     .bind(crate::db::now_ts())
-    .execute(pool)
+    .execute(executor)
     .await?;
     Ok(())
 }
@@ -99,7 +103,8 @@ pub fn hash_remote_addr(s: &str) -> String {
     let mut h = Sha256::new();
     h.update(s.as_bytes());
     let out = h.finalize();
-    // First 16 hex chars is plenty for de-duplication without identifying.
+    // This supports pseudonymous grouping, not anonymity. An address can
+    // still be recovered by trying its finite set of likely candidates.
     hex::encode(&out[..8])
 }
 

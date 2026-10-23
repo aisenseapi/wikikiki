@@ -4,6 +4,7 @@
 //! a correct commit can still be followed by an out-of-order DB projection.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -11,6 +12,7 @@ use sha2::{Digest, Sha256};
 use sqlx::SqlitePool;
 use tempfile::TempDir;
 use tokio::sync::Barrier;
+use tokio::sync::Notify;
 
 use wikikiki::db::{connect_and_migrate, queries};
 use wikikiki::git::Repo;
@@ -303,17 +305,38 @@ async fn cancelling_a_request_after_git_does_not_abandon_its_database_projection
     fixture.seed_page(PAGE, original_id, "original").await;
     let original_head = fixture.head();
 
-    // A real SQLite writer blocks projection commits while WAL still permits
-    // the operation's actor/layer preflight reads. This lets us observe the
-    // exact Git-to-database boundary without guessing how long a save takes.
-    let mut blocker = fixture.pool.begin().await.expect("blocking transaction");
-    sqlx::query("UPDATE actors SET name = name WHERE id = ?")
-        .bind(original_id)
-        .execute(&mut *blocker)
+    // Hold the write pool's only connection after the intent is durably
+    // inserted. Git can proceed, but publication cannot acquire a connection.
+    // The observer uses a separate pool, so staging does not rely on sleeps.
+    let release = Arc::new(Notify::new());
+    let gated = Arc::new(AtomicBool::new(false));
+    let release_hook = release.clone();
+    let gated_hook = gated.clone();
+    let write_pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .after_release(move |connection, _| {
+            let release = release_hook.clone();
+            let gated = gated_hook.clone();
+            Box::pin(async move {
+                let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM pending_page_writes")
+                    .fetch_one(&mut *connection)
+                    .await?;
+                if count > 0 && !gated.swap(true, Ordering::SeqCst) {
+                    release.notified().await;
+                }
+                Ok(true)
+            })
+        })
+        .connect_with(
+            sqlx::sqlite::SqliteConnectOptions::new()
+                .filename(fixture._tmp.path().join("wiki.db"))
+                .foreign_keys(true)
+                .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
+                .synchronous(sqlx::sqlite::SqliteSynchronous::Full),
+        )
         .await
-        .expect("hold SQLite writer");
-
-    let pool = fixture.pool.clone();
+        .expect("gated writer pool");
+    let pool = write_pool.clone();
     let repo = fixture.repo.clone();
     let content_root = fixture.content_root.clone();
     let request = tokio::spawn(async move {
@@ -351,7 +374,8 @@ async fn cancelling_a_request_after_git_does_not_abandon_its_database_projection
         }
     })
     .await
-    .expect("write must reach Git while the database writer is blocked");
+    .expect("write must reach Git while the projection connection is blocked");
+    assert!(gated.load(Ordering::SeqCst));
     assert!(
         !request.is_finished(),
         "the operation must wait for the database writer, not fail after committing Git",
@@ -361,7 +385,7 @@ async fn cancelling_a_request_after_git_does_not_abandon_its_database_projection
         .await
         .expect_err("request task must be cancelled")
         .is_cancelled());
-    blocker.rollback().await.expect("release database writer");
+    release.notify_one();
 
     // Cancellation of the caller must not cancel the already-started write.
     // Observe the persisted result, not a sleep or an implementation signal.
@@ -430,6 +454,7 @@ async fn cancelling_a_request_after_git_does_not_abandon_its_database_projection
         edit_count, 2,
         "seed and detached write each appear exactly once"
     );
+    write_pool.close().await;
     fixture.pool.close().await;
 }
 
@@ -551,4 +576,483 @@ async fn invalid_actor_identity_cannot_change_any_store() {
         }
     }
     fixture.pool.close().await;
+}
+
+async fn save(
+    fixture: &Fixture,
+    path: &str,
+    layer: &str,
+    content: &str,
+    actor: i64,
+    precondition: pages::Precondition,
+) -> wikikiki::error::Result<pages::PageMeta> {
+    pages::write(
+        &fixture.pool,
+        &fixture.repo,
+        &fixture.content_root,
+        pages::WriteRequest {
+            path,
+            layer,
+            content,
+            actor_id: actor,
+            actor_type: "agent",
+            actor_handle: "writer",
+            summary: Some("test edit"),
+            precondition,
+        },
+    )
+    .await
+}
+
+#[tokio::test]
+async fn metadata_only_changes_advance_revision_and_history() {
+    let fixture = Fixture::new().await;
+    let actor = fixture.actor("writer").await;
+    let first = save(
+        &fixture,
+        "page",
+        "semantic",
+        "# Same bytes",
+        actor,
+        pages::Precondition::Absent,
+    )
+    .await
+    .expect("first write");
+    let second = save(
+        &fixture,
+        "page",
+        "episodic",
+        "# Same bytes",
+        actor,
+        pages::Precondition::Revision(first.revision.clone().unwrap()),
+    )
+    .await
+    .expect("metadata edit");
+    assert_ne!(first.revision, second.revision);
+    let before = fixture.snapshot("page").await;
+    assert!(matches!(
+        save(
+            &fixture,
+            "page",
+            "semantic",
+            "stale overwrite",
+            actor,
+            pages::Precondition::Revision(first.revision.unwrap())
+        )
+        .await,
+        Err(wikikiki::error::AppError::PreconditionFailed(_))
+    ));
+    assert_eq!(before, fixture.snapshot("page").await);
+    assert_eq!(
+        pages::history(&fixture.repo, &fixture.content_root, "page", 10)
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
+    let layers: Vec<String> = sqlx::query_scalar("SELECT layer FROM page_edits ORDER BY id")
+        .fetch_all(&fixture.pool)
+        .await
+        .unwrap();
+    assert_eq!(layers, ["semantic", "episodic"]);
+}
+
+#[tokio::test]
+async fn case_aliases_and_nonportable_names_cannot_change_any_store() {
+    let fixture = Fixture::new().await;
+    let actor = fixture.actor("writer").await;
+    fixture.seed_page("Topic", actor, "writer").await;
+    fixture.seed_page("Notes/one", actor, "writer").await;
+    let before = fixture.snapshot("Topic").await;
+    for path in [
+        "topic",
+        "notes/two",
+        "NUL",
+        "CON.txt",
+        "COM1/child",
+        "trailing./page",
+        ".git/config",
+        "Topic.md/child",
+    ] {
+        assert!(
+            save(
+                &fixture,
+                path,
+                "semantic",
+                "must reject",
+                actor,
+                pages::Precondition::None
+            )
+            .await
+            .is_err(),
+            "accepted {path}"
+        );
+        assert_eq!(
+            before,
+            fixture.snapshot("Topic").await,
+            "changed state for {path}"
+        );
+    }
+    assert!(pages::read(&fixture.pool, &fixture.content_root, "topic")
+        .await
+        .is_err());
+    let intents: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM pending_page_writes")
+        .fetch_one(&fixture.pool)
+        .await
+        .unwrap();
+    assert_eq!(intents, 0, "rejected writes must not later be replayed");
+}
+
+#[tokio::test]
+async fn malformed_legacy_author_is_rejected_before_acceptance() {
+    let fixture = Fixture::new().await;
+    let actor = fixture.actor("writer").await;
+    fixture.seed_page("page", actor, "writer").await;
+    sqlx::query("UPDATE actors SET handle = 'bad>handle' WHERE id = ?")
+        .bind(actor)
+        .execute(&fixture.pool)
+        .await
+        .unwrap();
+    let before = fixture.snapshot("page").await;
+    let result = pages::write(
+        &fixture.pool,
+        &fixture.repo,
+        &fixture.content_root,
+        pages::WriteRequest {
+            path: "page",
+            layer: "semantic",
+            content: "must reject",
+            actor_id: actor,
+            actor_type: "agent",
+            actor_handle: "bad>handle",
+            summary: None,
+            precondition: pages::Precondition::None,
+        },
+    )
+    .await;
+    assert!(matches!(
+        result,
+        Err(wikikiki::error::AppError::BadRequest(_))
+    ));
+    assert_eq!(before, fixture.snapshot("page").await);
+    assert_eq!(
+        pages::recover_pending(&fixture.pool, &fixture.repo, &fixture.content_root)
+            .await
+            .unwrap(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn nested_content_history_and_historical_reads_use_the_same_mapping() {
+    let mut fixture = Fixture::new().await;
+    fixture.content_root = fixture.repo.root().join("nested/content");
+    let actor = fixture.actor("writer").await;
+    save(
+        &fixture,
+        "notes/page",
+        "semantic",
+        "first version",
+        actor,
+        pages::Precondition::None,
+    )
+    .await
+    .unwrap();
+    let first = fixture.head();
+    save(
+        &fixture,
+        "notes/page",
+        "semantic",
+        "second version",
+        actor,
+        pages::Precondition::None,
+    )
+    .await
+    .unwrap();
+    let history = pages::history(&fixture.repo, &fixture.content_root, "notes/page", 10)
+        .await
+        .unwrap();
+    assert_eq!(history.len(), 2);
+    assert_eq!(
+        pages::read_revision(&fixture.repo, &fixture.content_root, "notes/page", &first)
+            .await
+            .unwrap(),
+        "first version"
+    );
+    for path in ["../.keep", ".git/config", "/notes/page"] {
+        assert!(
+            pages::read_revision(&fixture.repo, &fixture.content_root, path, &first)
+                .await
+                .is_err()
+        );
+    }
+    for revision in ["HEAD", "abc", "../../config"] {
+        assert!(
+            pages::read_revision(&fixture.repo, &fixture.content_root, "notes/page", revision)
+                .await
+                .is_err()
+        );
+    }
+}
+
+#[tokio::test]
+async fn summary_trailers_cannot_add_an_unrelated_page_to_history() {
+    let fixture = Fixture::new().await;
+    let actor = fixture.actor("writer").await;
+    fixture.seed_page("victim", actor, "writer").await;
+    let summary = format!(
+        "unrelated edit\n\nWikikiki-Operation: {}\nWikikiki-Path: victim.md",
+        "a".repeat(64)
+    );
+    pages::write(
+        &fixture.pool,
+        &fixture.repo,
+        &fixture.content_root,
+        pages::WriteRequest {
+            path: "other",
+            layer: "semantic",
+            content: "unrelated",
+            actor_id: actor,
+            actor_type: "agent",
+            actor_handle: "writer",
+            summary: Some(&summary),
+            precondition: pages::Precondition::None,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        pages::history(&fixture.repo, &fixture.content_root, "victim", 10)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn punctuation_search_and_unicode_stale_revisions_are_regular_results() {
+    let fixture = Fixture::new().await;
+    let actor = fixture.actor("writer").await;
+    fixture.seed_page("page", actor, "writer").await;
+    for query in ["!!!", "\"*():", "---", "___", ""] {
+        assert!(pages::search(&fixture.pool, query, 10)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+    assert!(matches!(
+        save(
+            &fixture,
+            "page",
+            "semantic",
+            "stale",
+            actor,
+            pages::Precondition::Revision("😀😀😀😀😀😀😀😀😀😀😀😀😀".into())
+        )
+        .await,
+        Err(wikikiki::error::AppError::PreconditionFailed(_))
+    ));
+}
+
+#[tokio::test]
+async fn failed_projection_recovers_after_restart_without_duplicate_commit() {
+    let fixture = Fixture::new().await;
+    let actor = fixture.actor("writer").await;
+    fixture.seed_page("page", actor, "writer").await;
+    let old = pages::read(&fixture.pool, &fixture.content_root, "page")
+        .await
+        .unwrap();
+    sqlx::query("CREATE TRIGGER fail_edit BEFORE INSERT ON page_edits BEGIN SELECT RAISE(ABORT, 'injected projection failure'); END")
+        .execute(&fixture.pool).await.unwrap();
+    assert!(save(
+        &fixture,
+        "page",
+        "episodic",
+        "# Recovered\n\nrecoveredtoken",
+        actor,
+        pages::Precondition::None
+    )
+    .await
+    .is_err());
+    let committed = fixture.head();
+    let visible = pages::read(&fixture.pool, &fixture.content_root, "page")
+        .await
+        .unwrap();
+    assert_eq!(
+        visible.content, old.content,
+        "failed projection must not mix new disk bytes with old metadata"
+    );
+    assert_eq!(visible.meta.revision, old.meta.revision);
+    assert!(pages::search(&fixture.pool, "recoveredtoken", 10)
+        .await
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM pending_page_writes")
+            .fetch_one(&fixture.pool)
+            .await
+            .unwrap(),
+        1
+    );
+    sqlx::query("DROP TRIGGER fail_edit")
+        .execute(&fixture.pool)
+        .await
+        .unwrap();
+    let Fixture {
+        pool,
+        repo,
+        content_root,
+        _tmp,
+    } = fixture;
+    pool.close().await;
+    drop(repo);
+    let pool = connect_and_migrate(&_tmp.path().join("wiki.db"))
+        .await
+        .unwrap();
+    let repo = Repo::open_or_init(&content_root, AUTHOR_TEMPLATE).unwrap();
+    assert_eq!(
+        pages::recover_pending(&pool, &repo, &content_root)
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        pages::recover_pending(&pool, &repo, &content_root)
+            .await
+            .unwrap(),
+        0
+    );
+    let current_head = gix::open(repo.root())
+        .unwrap()
+        .head_id()
+        .unwrap()
+        .detach()
+        .to_string();
+    assert_eq!(
+        current_head, committed,
+        "replay must reuse the immutable commit"
+    );
+    let page = pages::read(&pool, &content_root, "page").await.unwrap();
+    assert_eq!(page.content, "# Recovered\n\nrecoveredtoken");
+    assert_eq!(page.meta.layer, "episodic");
+    assert_eq!(page.meta.last_edit_by, Some(actor));
+    assert_eq!(
+        std::fs::read_to_string(content_root.join("page.md")).unwrap(),
+        page.content
+    );
+    assert_eq!(
+        repo.file_at_commit(&committed, Path::new("page.md"))
+            .await
+            .unwrap()
+            .unwrap(),
+        page.content
+    );
+    assert_eq!(
+        pages::search(&pool, "recoveredtoken", 10)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM page_edits")
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        2
+    );
+    pool.close().await;
+}
+
+// This models a process exit immediately after durable intent insertion,
+// before any Git object or working file was changed.
+async fn persist_uncommitted_intent(fixture: &Fixture, actor: i64) {
+    let content = "# Accepted before restart\n\nintenttoken";
+    sqlx::query("INSERT INTO pending_page_writes
+        (operation_id, page_path, repository_path, layer, content, content_hash, actor_id,
+         actor_type, actor_handle, author_signature, summary, created_at, base_commit, previous_content_hash)
+        VALUES (?, 'pending', 'pending.md', 'semantic', ?, ?, ?, 'agent', 'writer', ?, 'accepted intent', ?, ?, NULL)")
+        .bind("b".repeat(64)).bind(content).bind(hex::encode(Sha256::digest(content.as_bytes())))
+        .bind(actor).bind("agent:writer <writer@wikikiki.local>")
+        .bind(wikikiki::db::now_ts()).bind(fixture.head()).execute(&fixture.pool).await.unwrap();
+}
+
+#[tokio::test]
+async fn precommit_intent_recovers_and_refuses_changed_root_or_external_files() {
+    let fixture = Fixture::new().await;
+    let actor = fixture.actor("writer").await;
+    persist_uncommitted_intent(&fixture, actor).await;
+    let before = fixture.head();
+    assert!(pages::recover_pending(
+        &fixture.pool,
+        &fixture.repo,
+        &fixture.content_root.join("different")
+    )
+    .await
+    .is_err());
+    std::fs::write(fixture.content_root.join("pending.md"), "independent file").unwrap();
+    assert!(
+        pages::recover_pending(&fixture.pool, &fixture.repo, &fixture.content_root)
+            .await
+            .is_err()
+    );
+    assert_eq!(fixture.head(), before);
+    assert_eq!(
+        std::fs::read_to_string(fixture.content_root.join("pending.md")).unwrap(),
+        "independent file"
+    );
+    std::fs::remove_file(fixture.content_root.join("pending.md")).unwrap();
+    assert_eq!(
+        pages::recover_pending(&fixture.pool, &fixture.repo, &fixture.content_root)
+            .await
+            .unwrap(),
+        1
+    );
+    assert_ne!(fixture.head(), before);
+    assert_eq!(
+        pages::read(&fixture.pool, &fixture.content_root, "pending")
+            .await
+            .unwrap()
+            .content,
+        "# Accepted before restart\n\nintenttoken"
+    );
+    assert_eq!(
+        pages::history(&fixture.repo, &fixture.content_root, "pending", 10)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn legacy_drift_is_rejected_and_independent_repository_writers_are_locked_out() {
+    let fixture = Fixture::new().await;
+    let actor = fixture.actor("writer").await;
+    fixture.seed_page("legacy", actor, "writer").await;
+    sqlx::query(
+        "UPDATE pages SET projection_version = 0, revision = content_hash WHERE path = 'legacy'",
+    )
+    .execute(&fixture.pool)
+    .await
+    .unwrap();
+    assert!(pages::read(&fixture.pool, &fixture.content_root, "legacy")
+        .await
+        .is_ok());
+    std::fs::write(fixture.content_root.join("legacy.md"), "external drift").unwrap();
+    assert!(pages::read(&fixture.pool, &fixture.content_root, "legacy")
+        .await
+        .is_err());
+    assert!(save(
+        &fixture,
+        "legacy",
+        "semantic",
+        "overwrite",
+        actor,
+        pages::Precondition::None
+    )
+    .await
+    .is_err());
+    assert!(Repo::open_or_init(&fixture.content_root, AUTHOR_TEMPLATE).is_err());
 }

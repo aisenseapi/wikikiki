@@ -1,0 +1,9 @@
+# Only compile inputs enter the build context. Keep local state and secrets out.
+**
+!Cargo.toml
+!Cargo.lock
+!src/
+!src/**
+!migrations/
+!migrations/**
+!wikikiki.example.toml

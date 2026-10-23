@@ -1,8 +1,12 @@
-# Stage 1 handoff pilot
+# External self-hosting and handoff pilot
 
 Status: playbook only. No pilot runs or results are recorded here.
 
 ## Purpose and current limits
+
+First ask an operator outside the development team to install the application
+using SELF_HOSTING.md. Record every intervention, then rehearse backup and restore
+on a separate instance. Record source revision, platform and elapsed time.
 
 Run five bounded tasks from real project work to learn whether shared pages help
 two agent clients and a human continue work without repeating the background.
@@ -10,10 +14,10 @@ Use existing pages, actor attribution, history, and REST calls. Task checkpoints
 are ordinary Markdown pages. They use the existing page API.
 
 Clients must refresh pages manually. There are no automatic change notifications,
-correction propagation, dependency checks, or revision compare-and-swap today.
-PUT replaces the whole page. A GET immediately before PUT does not prevent races.
-Assign one writer at a time to each checkpoint. Serialize human corrections and
-agent updates explicitly. Page namespaces are organizational, not access controls.
+correction propagation or source dependency checks. PUT replaces the whole page.
+GET returns an ETag. Updates must send it in If-Match and reconcile a 412 response.
+New pages use If-None-Match: *. A GET immediately before an unconditional PUT does
+not prevent races. Page namespaces are organizational, not access controls.
 
 ## Prepare each run
 
@@ -74,8 +78,9 @@ Refresh first: <checkpoint and source pages to re-read before continuing>.
 | 5. Environment change | Resume a real task after a documented branch, tool, configuration, path, or service change. Preserve the earlier environment in the checkpoint. | B checks current conditions, spots the stale assumption, and adapts the next step instead of blindly replaying an obsolete procedure. |
 
 Refresh the checkpoint and affected sources before each dependent action and
-before writing an update. If another participant needs to edit, transfer writer
-ownership first. Record this coordination cost as part of Stage 1's behavior.
+before writing an update. Record edit conflicts, reconciliations and coordination
+cost. Page revision checks protect the destination, not every source an agent
+used while preparing its update.
 
 ## Minimal current API use
 
@@ -84,14 +89,20 @@ These shell examples assume `WIKIKIKI_BASE` and the current actor's
 Keep tokens out of checkpoint bodies and result records.
 
 ```sh
-# Read raw Markdown. Save elsewhere if checkpoint.md contains unsaved edits.
+# Read raw Markdown and its revision. Preserve unsaved drafts first.
 curl --fail --silent --show-error \
   -H "Authorization: Bearer $WIKIKIKI_TOKEN" -H "Accept: text/markdown" \
-  "$WIKIKIKI_BASE/api/pages/tasks/pilot-01/checkpoint" -o checkpoint.md
+  -D checkpoint.headers \
+  "$WIKIKIKI_BASE/api/pages/tasks/pilot-01/checkpoint" -o checkpoint.md || exit 1
 
-# Create or replace the entire page from a UTF-8 file.
+# Continue only after the GET succeeds. Keep its ETag unchanged while editing.
+etag=$(awk 'tolower($1)=="etag:" {sub(/\r$/, "", $2); print $2}' checkpoint.headers)
+test -n "$etag" || exit 1
+
+# Edit checkpoint.md, then update only the revision read above.
 curl --fail --silent --show-error -X PUT \
   -H "Authorization: Bearer $WIKIKIKI_TOKEN" \
+  -H "If-Match: $etag" \
   -H "Content-Type: text/markdown" -H "X-Layer: semantic" \
   -H "X-Summary: Update pilot checkpoint" \
   --data-binary @checkpoint.md \
@@ -99,10 +110,14 @@ curl --fail --silent --show-error -X PUT \
 ```
 
 GET returns `text/markdown` unless Accept contains `application/json`. A missing
-page returns 404. PUT requires authentication and returns JSON with `ok`, `path`,
-`title`, and `layer`. These calls provide no revision token or conditional write.
-Read back a successful write. Investigate an error before retrying: a failed
-request may already have changed content, and retries have no idempotency key.
+page returns 404. To create it, use `If-None-Match: *` instead of `If-Match`.
+PUT requires authentication and returns JSON with `ok`, `path`, `title`, `layer`
+and `revision`, plus the new ETag. Treat the revision as opaque.
+On 412, retain the draft, fetch the current page into a different file and
+reconcile. Never retry the old draft with a newly fetched ETag without reviewing
+the intervening edit. Investigate other errors before retrying: a failed request
+may still complete, and retries have no idempotency key. See AGENT_API.md for
+the complete client contract.
 
 ## Evaluation and plain-Markdown control
 

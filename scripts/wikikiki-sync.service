@@ -1,14 +1,24 @@
 [Unit]
-Description=wikikiki sync — mirror OpenClaw workspace into wikikiki
-After=network.target
+Description=Wikikiki workspace sync
+After=network-online.target
+Wants=network-online.target
 
 [Service]
 Type=simple
-User=tagent
-EnvironmentFile=/etc/default/wikikiki-sync
-ExecStart=/bin/bash /home/tagent/wikikiki/scripts/wikikiki-sync.sh
-Restart=on-failure
-RestartSec=5s
+User=wikikiki-sync
+Group=wikikiki-sync
+EnvironmentFile=/etc/wikikiki/sync.env
+Environment=WIKIKIKI_STATE_DIR=/var/lib/wikikiki-sync
+StateDirectory=wikikiki-sync
+StateDirectoryMode=0700
+ExecStart=/usr/bin/python3 /usr/local/lib/wikikiki/wikikiki-sync.py
+# Stop on conflicts. The operator reconciles the page before restarting.
+Restart=no
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/wikikiki-sync
 
 [Install]
 WantedBy=multi-user.target

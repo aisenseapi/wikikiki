@@ -4,11 +4,8 @@
 //! short transactions, busy_timeout to absorb transient contention.
 
 use std::path::Path;
-use std::str::FromStr;
 
-use sqlx::sqlite::{
-    SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous,
-};
+use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
 use sqlx::SqlitePool;
 
 use crate::error::{AppError, Result};
@@ -24,12 +21,11 @@ pub async fn connect_and_migrate(path: &Path) -> Result<SqlitePool> {
         }
     }
 
-    let url = format!("sqlite://{}", path.display());
-    let opts = SqliteConnectOptions::from_str(&url)
-        .map_err(|e| AppError::Config(format!("sqlite url {url}: {e}")))?
+    let opts = SqliteConnectOptions::new()
+        .filename(path)
         .create_if_missing(true)
         .journal_mode(SqliteJournalMode::Wal)
-        .synchronous(SqliteSynchronous::Normal)
+        .synchronous(SqliteSynchronous::Full)
         .busy_timeout(std::time::Duration::from_secs(5))
         .foreign_keys(true);
 

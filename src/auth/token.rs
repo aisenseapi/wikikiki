@@ -30,7 +30,7 @@
 
 use rand::RngCore;
 use sha2::{Digest, Sha256};
-use sqlx::SqlitePool;
+use sqlx::{Executor, Sqlite, SqlitePool};
 use subtle::ConstantTimeEq;
 
 use crate::db::queries::Actor;
@@ -68,17 +68,22 @@ pub struct IssuedToken {
 
 /// Mint a new token for `actor_id` and store its hash. The plaintext is
 /// returned to the caller and must be shown to the user *exactly once*.
-pub async fn issue(
-    pool: &SqlitePool,
+pub async fn issue<'e, E>(
+    executor: E,
     actor_id: i64,
     label: Option<&str>,
     expires_at: Option<i64>,
-) -> Result<IssuedToken> {
+) -> Result<IssuedToken>
+where
+    E: Executor<'e, Database = Sqlite>,
+{
     let mut lookup_bytes = [0u8; 8];
     let mut secret_bytes = [0u8; 24];
-    let mut rng = rand::thread_rng();
-    rng.fill_bytes(&mut lookup_bytes);
-    rng.fill_bytes(&mut secret_bytes);
+    {
+        let mut rng = rand::thread_rng();
+        rng.fill_bytes(&mut lookup_bytes);
+        rng.fill_bytes(&mut secret_bytes);
+    }
     let lookup = hex::encode(lookup_bytes);
     let secret = hex::encode(secret_bytes);
     let plaintext = format!("{TOKEN_PREFIX}{lookup}_{secret}");
@@ -96,7 +101,7 @@ pub async fn issue(
     .bind(label)
     .bind(expires_at)
     .bind(now)
-    .fetch_one(pool)
+    .fetch_one(executor)
     .await?;
 
     Ok(IssuedToken {
@@ -157,7 +162,7 @@ pub async fn verify(
     let credential_id = row.0;
     let stored = &row.1;
     if is_legacy_argon2(stored) {
-        if !super::hash::verify(secret, stored)? {
+        if !super::hash::verify_async(secret, stored).await? {
             return Ok(None);
         }
         // Upgrade in place, once, on first successful use. Cheap here
@@ -165,15 +170,30 @@ pub async fn verify(
         // expensive path drains away on its own rather than needing a
         // migration that cannot recompute one-way hashes.
         let digest = secret_digest(secret);
-        if let Err(e) = sqlx::query("UPDATE credentials SET secret_hash = ? WHERE id = ?")
+        if let Err(e) = sqlx::query("UPDATE credentials SET secret_hash = ? WHERE id = ? AND secret_hash = ? AND revoked_at IS NULL")
             .bind(&digest)
             .bind(credential_id)
+            .bind(stored)
             .execute(pool)
             .await
         {
             // A failed upgrade is not a failed authentication; the row stays
             // legacy and we try again next time.
             tracing::warn!(error = %e, credential_id, "token digest upgrade failed");
+        }
+        // Argon2 may have waited while the operator revoked the credential or
+        // actor. Never grant access from the snapshot taken before that wait.
+        let still_live: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM credentials c JOIN actors a ON a.id = c.actor_id
+             WHERE c.id = ? AND c.revoked_at IS NULL AND a.is_active = 1
+               AND (c.expires_at IS NULL OR c.expires_at > ?))",
+        )
+        .bind(credential_id)
+        .bind(crate::db::now_ts())
+        .fetch_one(pool)
+        .await?;
+        if !still_live {
+            return Ok(None);
         }
     } else if !digest_matches(secret, stored) {
         return Ok(None);
@@ -201,12 +221,13 @@ pub async fn verify(
 
 /// Revoke a single credential row.
 pub async fn revoke(pool: &SqlitePool, credential_id: i64) -> Result<()> {
-    let updated = sqlx::query("UPDATE credentials SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL")
-        .bind(crate::db::now_ts())
-        .bind(credential_id)
-        .execute(pool)
-        .await?
-        .rows_affected();
+    let updated =
+        sqlx::query("UPDATE credentials SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL")
+            .bind(crate::db::now_ts())
+            .bind(credential_id)
+            .execute(pool)
+            .await?
+            .rows_affected();
     if updated == 0 {
         return Err(AppError::NotFound(format!("credential {credential_id}")));
     }

@@ -1,13 +1,3 @@
-# Tests run on every push and pull request to main.
-#
-# The suite is the point: Stage 1's correctness *is* the interaction between
-# disk, Git, SQLite and FTS, and `tests/page_consistency.rs` asserts guarantees
-# that only hold under concurrency. Those are exactly the properties that rot
-# silently when nobody runs them.
-#
-# Only first-party actions are used, so the workflow adds no third-party
-# supply-chain surface. Rust comes preinstalled on the GitHub-hosted runners.
-
 name: CI
 
 on:
@@ -16,25 +6,29 @@ on:
   pull_request:
     branches: [main]
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
-  # Fail fast in CI rather than retrying a locked database for five seconds.
   RUST_BACKTRACE: 1
 
 jobs:
   test:
-    name: Test
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-
+    name: Test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
-
       - name: Record toolchain
         run: |
           rustc --version
           cargo --version
-
+          python --version
       - name: Cache cargo registry and build
         uses: actions/cache@v4
         with:
@@ -45,30 +39,22 @@ jobs:
             target
           key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-
-
-      # --locked fails rather than silently resolving a different dependency
-      # graph than the one the tests were verified against.
       - name: Build
         run: cargo build --locked --all-targets
-
-      - name: Test
+      - name: Rust tests
         run: cargo test --locked
+      - name: Sync client regression tests
+        run: python -B -m unittest discover -s scripts/tests -v
+      - name: Shell syntax
+        if: runner.os == 'Linux'
+        run: bash -n scripts/wikikiki-sync.sh test.sh
 
   lint:
-    name: Lint (informational)
+    name: Formatting and Clippy
     runs-on: ubuntu-latest
-    timeout-minutes: 20
-
-    # Neither check passes on the current tree: rustfmt would reformat several
-    # files and clippy reports eight lints. Gating on them would mean a red CI
-    # that says nothing about whether the code works. They run here so the
-    # backlog stays visible, and should be promoted to blocking once the tree
-    # is clean — not before.
-    continue-on-error: true
-
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
-
       - name: Cache cargo registry and build
         uses: actions/cache@v4
         with:
@@ -79,14 +65,48 @@ jobs:
             target
           key: ${{ runner.os }}-cargo-lint-${{ hashFiles('Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-lint-
-
       - name: Formatting
         run: cargo fmt --all -- --check
-
-      # `continue-on-error` on the job keeps a lint failure from turning the
-      # workflow red, but steps within a job still short-circuit: without
-      # `always()` a formatting failure skips clippy entirely, and half the
-      # backlog this job exists to surface never gets reported.
       - name: Clippy
-        if: always()
         run: cargo clippy --locked --all-targets -- -D warnings
+
+  container:
+    name: Linux container, restart and restore
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build image
+        run: |
+          cp wikikiki.example.toml wikikiki.toml
+          docker compose config --quiet
+          docker compose build --pull
+      - name: Bootstrap and verify durable operation
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf '%s\n' 'temporary-ci-password' | docker compose run --rm -T wikikiki bootstrap --handle admin --password-stdin
+          docker compose up -d --wait --wait-timeout 120
+          test "$(docker compose exec -T wikikiki id -u)" = 10001
+          token="$(docker compose exec -T wikikiki /usr/local/bin/wikikiki --config /etc/wikikiki/wikikiki.toml issue-token --handle smoke --label CI --lifetime 1h | sed -n 's/^token: *//p')"
+          test -n "$token"
+          echo "::add-mask::$token"
+          export WIKIKIKI_TOKEN="$token"
+          export WIKIKIKI_BASE=http://127.0.0.1:8090
+          smoke_path="tests/ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          python -B scripts/tests/smoke_http.py --path "$smoke_path" --expect-private
+          docker compose restart --timeout 60
+          docker compose up -d --wait --wait-timeout 120
+          python -B scripts/tests/smoke_http.py --path "$smoke_path" --verify-only --expect-private
+          docker compose stop
+          docker compose run --rm -T --no-deps --entrypoint tar wikikiki -C /data -czf - . > "$RUNNER_TEMP/wikikiki-backup.tar.gz"
+          export WIKIKIKI_VOLUME=wikikiki-restore-test
+          docker compose run --rm -T --no-deps --entrypoint tar wikikiki -C /data -xzf - < "$RUNNER_TEMP/wikikiki-backup.tar.gz"
+          docker compose up -d --wait --wait-timeout 120
+          python -B scripts/tests/smoke_http.py --path "$smoke_path" --verify-only --expect-private
+      - name: Container logs on failure
+        if: failure()
+        run: docker compose logs --no-color
+      - name: Stop containers
+        if: always()
+        run: docker compose down

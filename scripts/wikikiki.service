@@ -1,0 +1,24 @@
+[Unit]
+Description=Wikikiki shared workspace
+After=network.target
+
+[Service]
+Type=simple
+User=wikikiki
+Group=wikikiki
+StateDirectory=wikikiki
+StateDirectoryMode=0700
+WorkingDirectory=/var/lib/wikikiki
+ExecStart=/usr/local/bin/wikikiki --config /etc/wikikiki/wikikiki.toml serve
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=60s
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/wikikiki
+
+[Install]
+WantedBy=multi-user.target

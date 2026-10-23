@@ -10,8 +10,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{AppError, Result};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct Config {
     pub paths: Paths,
     pub server: Server,
@@ -20,20 +20,8 @@ pub struct Config {
     pub git: Git,
 }
 
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            paths: Paths::default(),
-            server: Server::default(),
-            ui: Ui::default(),
-            auth: Auth::default(),
-            git: Git::default(),
-        }
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct Paths {
     pub content_root: PathBuf,
     pub db_path: PathBuf,
@@ -51,7 +39,7 @@ impl Default for Paths {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct Server {
     pub bind: String,
     pub public_url: String,
@@ -67,7 +55,7 @@ impl Default for Server {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct Ui {
     pub markdown_renderer: String,
     pub allow_anonymous_read: bool,
@@ -78,14 +66,14 @@ impl Default for Ui {
     fn default() -> Self {
         Self {
             markdown_renderer: "comrak".to_string(),
-            allow_anonymous_read: true,
+            allow_anonymous_read: false,
             require_auth_for_write: true,
         }
     }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct Auth {
     /// Cookie lifetime for human sessions.
     pub session_lifetime: HumanDuration,
@@ -113,7 +101,7 @@ impl Default for Auth {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct Git {
     pub author_template: String,
 }
@@ -153,15 +141,12 @@ impl<'de> Deserialize<'de> for HumanDuration {
     }
 }
 
-fn parse_duration(s: &str) -> std::result::Result<Duration, String> {
+pub fn parse_duration(s: &str) -> std::result::Result<Duration, String> {
     let s = s.trim();
     if s.is_empty() {
         return Err("empty duration".into());
     }
-    let (num_str, unit) = s.split_at(
-        s.find(|c: char| !c.is_ascii_digit())
-            .unwrap_or(s.len()),
-    );
+    let (num_str, unit) = s.split_at(s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len()));
     let n: u64 = num_str
         .parse()
         .map_err(|_| format!("invalid number in duration: {s}"))?;
@@ -174,18 +159,22 @@ fn parse_duration(s: &str) -> std::result::Result<Duration, String> {
         "y" => 365 * 86_400,
         other => return Err(format!("unknown duration unit: '{other}'")),
     };
-    Ok(Duration::from_secs(n * mult))
+    let seconds = n
+        .checked_mul(mult)
+        .filter(|seconds| *seconds > 0 && *seconds <= i64::MAX as u64 / 2)
+        .ok_or_else(|| "duration must be positive and fit in a timestamp".to_string())?;
+    Ok(Duration::from_secs(seconds))
 }
 
 fn format_duration(d: Duration) -> String {
     let s = d.as_secs();
-    if s % (365 * 86_400) == 0 {
+    if s.is_multiple_of(365 * 86_400) {
         format!("{}y", s / (365 * 86_400))
-    } else if s % 86_400 == 0 {
+    } else if s.is_multiple_of(86_400) {
         format!("{}d", s / 86_400)
-    } else if s % 3600 == 0 {
+    } else if s.is_multiple_of(3600) {
         format!("{}h", s / 3600)
-    } else if s % 60 == 0 {
+    } else if s.is_multiple_of(60) {
         format!("{}m", s / 60)
     } else {
         format!("{s}s")
@@ -204,16 +193,13 @@ impl Config {
             .unwrap_or_else(|| self.server.public_url.starts_with("https://"))
     }
 
-    /// Load from a TOML path. Missing file → defaults.
+    /// Explicit paths must exist. Without a path, look for ./wikikiki.toml.
     pub fn load(path: Option<&std::path::Path>) -> Result<Self> {
         let base = if let Some(p) = path {
-            if p.exists() {
-                let raw = std::fs::read_to_string(p)?;
-                toml::from_str::<Config>(&raw)
-                    .map_err(|e| AppError::Config(format!("parse {}: {e}", p.display())))?
-            } else {
-                Config::default()
-            }
+            let raw = std::fs::read_to_string(p)
+                .map_err(|e| AppError::Config(format!("read {}: {e}", p.display())))?;
+            toml::from_str::<Config>(&raw)
+                .map_err(|e| AppError::Config(format!("parse {}: {e}", p.display())))?
         } else {
             // Look for ./wikikiki.toml; fall back to defaults.
             let candidate = PathBuf::from("./wikikiki.toml");
@@ -225,11 +211,52 @@ impl Config {
                 Config::default()
             }
         };
-        Ok(apply_env_overrides(base))
+        let cfg = apply_env_overrides(base)?;
+        cfg.validate()?;
+        Ok(cfg)
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        if !self.ui.require_auth_for_write {
+            return Err(AppError::Config(
+                "anonymous writes are unsupported: ui.require_auth_for_write must be true".into(),
+            ));
+        }
+        if self.ui.markdown_renderer != "comrak" {
+            return Err(AppError::Config(
+                "ui.markdown_renderer must be comrak".into(),
+            ));
+        }
+        if !matches!(
+            self.auth.log_remote_addr.as_str(),
+            "plain" | "hashed" | "none"
+        ) {
+            return Err(AppError::Config(
+                "auth.log_remote_addr must be plain, hashed or none".into(),
+            ));
+        }
+        let uri = self
+            .server
+            .public_url
+            .parse::<axum::http::Uri>()
+            .map_err(|_| {
+                AppError::Config("server.public_url must be an HTTP or HTTPS origin".into())
+            })?;
+        if !matches!(uri.scheme_str(), Some("http" | "https"))
+            || uri
+                .authority()
+                .is_none_or(|a| a.host().is_empty() || a.as_str().contains('@'))
+            || !matches!(uri.path(), "" | "/")
+            || uri.query().is_some()
+            || self.server.public_url.contains('#')
+        {
+            return Err(AppError::Config("server.public_url must be an HTTP or HTTPS origin without a path, query or credentials".into()));
+        }
+        Ok(())
     }
 }
 
-fn apply_env_overrides(mut cfg: Config) -> Config {
+fn apply_env_overrides(mut cfg: Config) -> Result<Config> {
     if let Ok(v) = std::env::var("WIKIKIKI_BIND") {
         cfg.server.bind = v;
     }
@@ -246,12 +273,20 @@ fn apply_env_overrides(mut cfg: Config) -> Config {
         cfg.paths.git_repo = PathBuf::from(v);
     }
     if let Ok(v) = std::env::var("WIKIKIKI_ALLOW_ANON_READ") {
-        cfg.ui.allow_anonymous_read = matches!(v.as_str(), "1" | "true" | "yes");
+        cfg.ui.allow_anonymous_read = parse_bool_env("WIKIKIKI_ALLOW_ANON_READ", &v)?;
     }
     if let Ok(v) = std::env::var("WIKIKIKI_REQUIRE_AUTH_WRITE") {
-        cfg.ui.require_auth_for_write = matches!(v.as_str(), "1" | "true" | "yes");
+        cfg.ui.require_auth_for_write = parse_bool_env("WIKIKIKI_REQUIRE_AUTH_WRITE", &v)?;
     }
-    cfg
+    Ok(cfg)
+}
+
+fn parse_bool_env(name: &str, value: &str) -> Result<bool> {
+    match value {
+        "1" | "true" | "yes" => Ok(true),
+        "0" | "false" | "no" => Ok(false),
+        _ => Err(AppError::Config(format!("{name} must be true or false"))),
+    }
 }
 
 #[cfg(test)]
@@ -287,7 +322,7 @@ mod tests {
     #[test]
     fn defaults_load() {
         let cfg = Config::default();
-        assert!(cfg.ui.allow_anonymous_read);
+        assert!(!cfg.ui.allow_anonymous_read);
         assert!(cfg.ui.require_auth_for_write);
         assert_eq!(cfg.server.bind, "127.0.0.1:8090");
     }
@@ -302,5 +337,33 @@ mod tests {
         assert_eq!(cfg.server.bind, "0.0.0.0:9090");
         // Other fields stay at defaults.
         assert_eq!(cfg.paths.content_root, PathBuf::from("./content"));
+    }
+
+    #[test]
+    fn invalid_configuration_fails_instead_of_silently_changing_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(Config::load(Some(&dir.path().join("missing.toml"))).is_err());
+        for raw in [
+            "0s",
+            "18446744073709551615y",
+            "9223372036854775807s",
+            "nope",
+        ] {
+            assert!(parse_duration(raw).is_err(), "{raw}");
+        }
+        assert!(parse_bool_env("TEST", "treu").is_err());
+        let mut cfg = Config::default();
+        cfg.ui.require_auth_for_write = false;
+        assert!(cfg.validate().is_err());
+        for url in [
+            "http:///bad",
+            "https://host/path",
+            "https://user:secret@host",
+            "https://host/?key=value",
+        ] {
+            let mut cfg = Config::default();
+            cfg.server.public_url = url.into();
+            assert!(cfg.validate().is_err(), "{url}");
+        }
     }
 }

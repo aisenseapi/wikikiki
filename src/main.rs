@@ -6,6 +6,7 @@
 //!   issue-token   create or reuse an actor and mint a bearer token.
 //!   list-actors   show all actors and their status.
 
+use std::io::Read;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
@@ -20,9 +21,13 @@ use wikikiki::git::Repo;
 use wikikiki::web::{router, AppState};
 
 #[derive(Parser, Debug)]
-#[command(name = "wikikiki", version, about = "A wiki that is the live memory of a system of actors.")]
+#[command(
+    name = "wikikiki",
+    version,
+    about = "A self-hosted workspace for people and agents."
+)]
 struct Cli {
-    /// Path to wikikiki.toml. Defaults to ./wikikiki.toml; missing → defaults.
+    /// Path to an existing TOML file. Otherwise ./wikikiki.toml or defaults.
     #[arg(long, global = true)]
     config: Option<PathBuf>,
 
@@ -41,8 +46,16 @@ enum Cmd {
         handle: String,
         #[arg(long)]
         name: Option<String>,
+        /// Prefer --password-stdin to keep passwords out of shell history.
+        #[arg(
+            long,
+            conflicts_with = "password_stdin",
+            required_unless_present = "password_stdin"
+        )]
+        password: Option<String>,
+        /// Read the password from stdin, removing its final line ending.
         #[arg(long)]
-        password: String,
+        password_stdin: bool,
     },
 
     /// Issue a bearer token. Prints plaintext to stdout once.
@@ -66,6 +79,33 @@ enum Cmd {
 
     /// List all actors with their type and status.
     ListActors,
+
+    /// List credential IDs and expiry/revocation status. Never prints secrets.
+    ListCredentials {
+        #[arg(long)]
+        handle: Option<String>,
+    },
+    /// Revoke a password or token by credential ID.
+    RevokeCredential {
+        #[arg(long)]
+        id: i64,
+        #[arg(long, default_value = "system")]
+        issuer: String,
+    },
+    /// Sign an actor out of all browser sessions.
+    RevokeSessions {
+        #[arg(long)]
+        handle: String,
+        #[arg(long, default_value = "system")]
+        issuer: String,
+    },
+    /// Disable an actor and revoke access, retaining attributed history.
+    DeactivateActor {
+        #[arg(long)]
+        handle: String,
+        #[arg(long, default_value = "system")]
+        issuer: String,
+    },
 }
 
 #[tokio::main]
@@ -78,7 +118,9 @@ async fn main() {
 
 async fn run() -> Result<()> {
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
         .with_target(false)
         .compact()
         .init();
@@ -88,29 +130,56 @@ async fn run() -> Result<()> {
 
     match cli.cmd.unwrap_or(Cmd::Serve) {
         Cmd::Serve => serve(cfg).await,
-        Cmd::Bootstrap { handle, name, password } => {
+        Cmd::Bootstrap {
+            handle,
+            name,
+            password,
+            password_stdin,
+        } => {
+            let password = if password_stdin {
+                let mut value = String::new();
+                std::io::stdin()
+                    .lock()
+                    .take(4099)
+                    .read_to_string(&mut value)?;
+                if value.len() > 4098 {
+                    return Err(wikikiki::error::AppError::BadRequest(
+                        "password input is too long".into(),
+                    ));
+                }
+                if value.ends_with('\n') {
+                    value.pop();
+                    if value.ends_with('\r') {
+                        value.pop();
+                    }
+                }
+                if value.is_empty() || value.len() > 4096 {
+                    return Err(wikikiki::error::AppError::BadRequest(
+                        "password must contain 1 to 4096 bytes".into(),
+                    ));
+                }
+                value
+            } else {
+                password.ok_or_else(|| {
+                    wikikiki::error::AppError::BadRequest("password is required".into())
+                })?
+            };
             let pool = connect_and_migrate(&cfg.paths.db_path).await?;
             let id = bootstrap_admin(&pool, &handle, name.as_deref(), &password).await?;
             println!("bootstrapped admin: handle={handle} id={id}");
             Ok(())
         }
-        Cmd::IssueToken { handle, r#type, name, label, lifetime, issuer } => {
-            let pool = connect_and_migrate(&cfg.paths.db_path).await?;
-            let issuer_actor = queries::actor_by_handle(&pool, &issuer).await?;
-            let issuer_id = match issuer_actor {
-                Some(a) => a.id,
-                None => {
-                    // For first-run convenience, auto-create a 'system' actor for audit if missing.
-                    if issuer == "system" {
-                        queries::insert_actor(&pool, "system", "system", "system", false).await?
-                    } else {
-                        return Err(wikikiki::error::AppError::NotFound(format!(
-                            "issuer handle '{issuer}' not found"
-                        )));
-                    }
-                }
-            };
+        Cmd::IssueToken {
+            handle,
+            r#type,
+            name,
+            label,
+            lifetime,
+            issuer,
+        } => {
             let exp = parse_lifetime(&cfg, lifetime.as_deref())?;
+            let pool = connect_and_migrate(&cfg.paths.db_path).await?;
+            let issuer_id = operator_id(&pool, &issuer).await?;
             let (actor_id, plaintext) = issue_actor_token(
                 &pool,
                 &handle,
@@ -124,7 +193,7 @@ async fn run() -> Result<()> {
             println!("actor_id: {actor_id}");
             println!("token:    {plaintext}");
             println!();
-            println!("Store this token now — it will not be shown again.");
+            println!("Store this token now. It will not be shown again.");
             Ok(())
         }
         Cmd::ListActors => {
@@ -141,23 +210,65 @@ async fn run() -> Result<()> {
             }
             Ok(())
         }
+        Cmd::ListCredentials { handle } => {
+            let pool = connect_and_migrate(&cfg.paths.db_path).await?;
+            let items = wikikiki::actor::list_credentials(&pool, handle.as_deref()).await?;
+            println!("ID\tACTOR\tKIND\tLABEL\tEXPIRES (unix)\tREVOKED (unix)");
+            for item in items {
+                println!(
+                    "{}\t{}\t{}\t{}\t{}\t{}",
+                    item.id,
+                    item.actor_handle,
+                    item.kind,
+                    item.label.as_deref().unwrap_or("-"),
+                    item.expires_at
+                        .map(|v| v.to_string())
+                        .unwrap_or_else(|| "never".into()),
+                    item.revoked_at
+                        .map(|v| v.to_string())
+                        .unwrap_or_else(|| "-".into())
+                );
+            }
+            Ok(())
+        }
+        Cmd::RevokeCredential { id, issuer } => {
+            let pool = connect_and_migrate(&cfg.paths.db_path).await?;
+            let issuer_id = operator_id(&pool, &issuer).await?;
+            wikikiki::actor::revoke_credential(&pool, id, issuer_id).await?;
+            println!("revoked credential: {id}");
+            Ok(())
+        }
+        Cmd::RevokeSessions { handle, issuer } => {
+            let pool = connect_and_migrate(&cfg.paths.db_path).await?;
+            let issuer_id = operator_id(&pool, &issuer).await?;
+            let count = wikikiki::actor::revoke_sessions(&pool, &handle, issuer_id).await?;
+            println!("revoked {count} sessions for {handle}");
+            Ok(())
+        }
+        Cmd::DeactivateActor { handle, issuer } => {
+            let pool = connect_and_migrate(&cfg.paths.db_path).await?;
+            let issuer_id = operator_id(&pool, &issuer).await?;
+            wikikiki::actor::deactivate_actor(&pool, &handle, issuer_id).await?;
+            println!("deactivated actor: {handle}");
+            Ok(())
+        }
     }
 }
 
 async fn serve(cfg: Config) -> Result<()> {
-    let pool = connect_and_migrate(&cfg.paths.db_path).await?;
     let repo = Repo::open_or_init(&cfg.paths.git_repo, &cfg.git.author_template)?;
-    let bind: SocketAddr = cfg
-        .server
-        .bind
-        .parse()
-        .map_err(|e| wikikiki::error::AppError::Config(format!("server.bind '{}': {e}", cfg.server.bind)))?;
+    let pool = connect_and_migrate(&cfg.paths.db_path).await?;
+    wikikiki::pages::recover_pending(&pool, &repo, &cfg.paths.content_root).await?;
+    let bind: SocketAddr = cfg.server.bind.parse().map_err(|e| {
+        wikikiki::error::AppError::Config(format!("server.bind '{}': {e}", cfg.server.bind))
+    })?;
 
     let state = AppState::new(pool, repo, cfg);
     let write_drain = state.repo.clone();
 
     let app = router(state);
-    let listener = tokio::net::TcpListener::bind(bind).await
+    let listener = tokio::net::TcpListener::bind(bind)
+        .await
         .map_err(|e| wikikiki::error::AppError::Config(format!("bind {bind}: {e}")))?;
     tracing::info!("wikikiki listening on http://{}", bind);
 
@@ -213,26 +324,25 @@ fn parse_lifetime(cfg: &Config, raw: Option<&str>) -> Result<Option<i64>> {
     let raw = match raw {
         Some(s) if !s.is_empty() => s,
         _ => {
-            return Ok(cfg.auth.token_default_lifetime.map(|d| now_ts() + d.as_secs()));
+            return Ok(cfg
+                .auth
+                .token_default_lifetime
+                .map(|d| now_ts() + d.as_secs()));
         }
     };
-    // Quick parser: digits + unit suffix (s/m/h/d/w/y). Reuses the config grammar.
-    let (n, unit) = raw.split_at(raw.find(|c: char| !c.is_ascii_digit()).unwrap_or(raw.len()));
-    let n: i64 = n.parse().map_err(|_| {
-        wikikiki::error::AppError::BadRequest(format!("invalid lifetime: {raw}"))
-    })?;
-    let mult: i64 = match unit {
-        "s" | "" => 1,
-        "m" => 60,
-        "h" => 3600,
-        "d" => 86_400,
-        "w" => 7 * 86_400,
-        "y" => 365 * 86_400,
-        other => {
-            return Err(wikikiki::error::AppError::BadRequest(format!(
-                "unknown duration unit: '{other}'"
-            )))
-        }
-    };
-    Ok(Some(now_ts() + n * mult))
+    let duration =
+        wikikiki::config::parse_duration(raw).map_err(wikikiki::error::AppError::BadRequest)?;
+    Ok(Some(now_ts() + duration.as_secs() as i64))
+}
+
+async fn operator_id(pool: &sqlx::SqlitePool, handle: &str) -> Result<i64> {
+    if let Some(actor) = queries::actor_by_handle(pool, handle).await? {
+        return Ok(actor.id);
+    }
+    if handle == "system" {
+        return queries::insert_actor(pool, "system", "system", "system", false).await;
+    }
+    Err(wikikiki::error::AppError::NotFound(format!(
+        "issuer handle '{handle}' not found"
+    )))
 }

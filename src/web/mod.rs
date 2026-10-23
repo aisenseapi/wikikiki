@@ -4,12 +4,12 @@
 //! actor (or anonymous) before any handler runs. Handlers then enforce
 //! per-route access rules.
 
+mod login_limit;
 pub mod templates;
 
 use std::sync::Arc;
 
 use axum::extract::{ConnectInfo, Path, Query, Request, State};
-use std::net::SocketAddr;
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::middleware::{from_fn, Next};
 use axum::response::{Html, IntoResponse, Redirect, Response};
@@ -17,6 +17,7 @@ use axum::routing::{get, post};
 use axum::Router;
 use serde::Deserialize;
 use sqlx::SqlitePool;
+use std::net::SocketAddr;
 use tower_http::trace::TraceLayer;
 
 use crate::auth::{self, Auth, Surface};
@@ -40,6 +41,7 @@ pub struct AppState {
     pub actor_seen: Throttle,
     /// Coalesces `credentials.last_used_at` writes.
     pub credential_used: Throttle,
+    login_limit: login_limit::LoginLimit,
 }
 
 impl AppState {
@@ -50,6 +52,7 @@ impl AppState {
             config: Arc::new(config),
             actor_seen: Throttle::new(LIVENESS_INTERVAL_SECS),
             credential_used: Throttle::new(LIVENESS_INTERVAL_SECS),
+            login_limit: login_limit::LoginLimit::default(),
         }
     }
 }
@@ -65,6 +68,7 @@ pub fn router(state: AppState) -> Router {
         .route("/logout", post(logout))
         .route("/wiki/*path", get(view_page).post(save_page))
         .route("/wiki-history/*path", get(history_page))
+        .route("/wiki-revision/*path", get(revision_page))
         .route("/search", get(search_page))
         .route("/me", get(me_page))
         .route("/actors", get(list_actors_page));
@@ -77,6 +81,9 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .merge(ui)
         .merge(api)
+        .route("/healthz", get(health))
+        .route("/new", get(new_page))
+        .route("/guide", get(workspace_guide))
         .layer(from_fn(move |req, next| {
             let s = mw_state.clone();
             async move { auth_middleware(s, req, next).await }
@@ -103,9 +110,13 @@ async fn security_headers(req: Request, next: Next) -> Response {
     let mut resp = next.run(req).await;
     let h = resp.headers_mut();
     h.insert("content-security-policy", HeaderValue::from_static(CSP));
-    h.insert("x-content-type-options", HeaderValue::from_static("nosniff"));
+    h.insert(
+        "x-content-type-options",
+        HeaderValue::from_static("nosniff"),
+    );
     h.insert("referrer-policy", HeaderValue::from_static("same-origin"));
     h.insert("x-frame-options", HeaderValue::from_static("DENY"));
+    h.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     resp
 }
 
@@ -117,6 +128,20 @@ async fn security_headers(req: Request, next: Next) -> Response {
 struct Anonymous;
 
 async fn auth_middleware(state: AppState, mut req: Request, next: Next) -> Response {
+    if !matches!(
+        *req.method(),
+        axum::http::Method::GET | axum::http::Method::HEAD | axum::http::Method::OPTIONS
+    ) {
+        // Browsers send Origin on form submissions. Non-browser clients may
+        // omit it, but an explicit foreign or malformed origin is refused.
+        match single_header(req.headers(), "origin") {
+            Ok(Some(origin)) if origin != state.config.server.public_url.trim_end_matches('/') => {
+                return AppError::Forbidden.into_response();
+            }
+            Err(error) => return error.into_response(),
+            _ => {}
+        }
+    }
     let path = req.uri().path().to_string();
     let surface = if path.starts_with("/api/") {
         Surface::Api
@@ -127,18 +152,20 @@ async fn auth_middleware(state: AppState, mut req: Request, next: Next) -> Respo
     // Extract identifying headers into owned values BEFORE any await — the
     // request type isn't Sync and holding `&req` across an await yields a
     // !Send future that can't be used in axum's Send-bounded middleware.
-    let auth_header = req
-        .headers()
-        .get(header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_string);
+    let auth_header = match single_header(req.headers(), "authorization") {
+        Ok(value) => value.map(str::to_string),
+        Err(error) => return error.into_response(),
+    };
     let cookie_header = req
         .headers()
         .get(header::COOKIE)
         .and_then(|v| v.to_str().ok())
         .map(str::to_string);
 
-    let auth_opt = resolve_actor(&state, surface, auth_header, cookie_header).await;
+    let auth_opt = match resolve_actor(&state, surface, auth_header, cookie_header).await {
+        Ok(auth) => auth,
+        Err(error) => return error.into_response(),
+    };
 
     // Stash auth in extensions for handlers to read.
     match &auth_opt {
@@ -178,34 +205,35 @@ async fn resolve_actor(
     surface: Surface,
     auth_header: Option<String>,
     cookie_header: Option<String>,
-) -> Option<Auth> {
+) -> Result<Option<Auth>> {
     // 1. Bearer token (api surface, but also accepted on ui — useful for curl/dev).
     if let Some(s) = auth_header.as_deref() {
-        if let Some(tok) = s.strip_prefix("Bearer ") {
-            if let Ok(Some(actor)) =
-                auth::token::verify(&state.pool, tok, &state.credential_used).await
-            {
-                return Some(Auth { actor, surface });
-            }
-        }
+        let tok = s
+            .strip_prefix("Bearer ")
+            .filter(|token| !token.is_empty())
+            .ok_or(AppError::Unauthorized)?;
+        let actor = auth::token::verify(&state.pool, tok, &state.credential_used)
+            .await?
+            .ok_or(AppError::Unauthorized)?;
+        return Ok(Some(Auth { actor, surface }));
     }
 
     // 2. Session cookie.
     if let Some(s) = cookie_header.as_deref() {
         if let Some(sid) = parse_cookie(s, auth::session::COOKIE_NAME) {
-            if let Ok(Some(actor)) = auth::session::lookup(&state.pool, &sid).await {
-                return Some(Auth {
+            if let Some(actor) = auth::session::lookup(&state.pool, &sid).await? {
+                return Ok(Some(Auth {
                     actor,
                     surface: Surface::Ui,
-                });
+                }));
             }
         }
     }
 
-    None
+    Ok(None)
 }
 
-fn parse_cookie<'a>(header_value: &'a str, name: &str) -> Option<String> {
+fn parse_cookie(header_value: &str, name: &str) -> Option<String> {
     for piece in header_value.split(';') {
         let piece = piece.trim();
         if let Some((k, v)) = piece.split_once('=') {
@@ -241,9 +269,7 @@ fn require_read(state: &AppState, auth: Option<&Auth>) -> Result<()> {
     }
 }
 
-/// Stage 1 enforces "every write is attributed" by requiring an actor on every
-/// write regardless of `require_auth_for_write`. Toggling that config off only
-/// affects *reads*; we do not synthesize a guest actor.
+/// Every write requires an authenticated actor.
 fn require_writer<'a>(_state: &AppState, auth: Option<&'a Auth>) -> Result<&'a Auth> {
     auth.ok_or(AppError::Unauthorized)
 }
@@ -252,11 +278,65 @@ fn require_writer<'a>(_state: &AppState, auth: Option<&'a Auth>) -> Result<&'a A
 // Handlers — UI
 // =========================================================================
 
-async fn home(State(state): State<AppState>, req: Request) -> Result<Html<String>> {
+async fn home(State(state): State<AppState>, req: Request) -> Result<Response> {
+    let auth = current_auth(req.extensions());
+    if !can_read(&state, auth) {
+        return Ok(Redirect::to("/login").into_response());
+    }
+    let recent = pages::recent(&state.pool, 25).await?;
+    Ok(Html(templates::home(auth, &recent).into_string()).into_response())
+}
+
+async fn health(State(state): State<AppState>) -> StatusCode {
+    match sqlx::query_scalar::<_, i64>("SELECT 1")
+        .fetch_one(&state.pool)
+        .await
+    {
+        Ok(1) => StatusCode::OK,
+        _ => StatusCode::SERVICE_UNAVAILABLE,
+    }
+}
+
+#[derive(Deserialize)]
+struct NewPageQuery {
+    path: Option<String>,
+    template: Option<String>,
+}
+
+async fn new_page(
+    State(state): State<AppState>,
+    Query(q): Query<NewPageQuery>,
+    req: Request,
+) -> Result<Response> {
+    let auth = current_auth(req.extensions());
+    require_writer(&state, auth)?;
+    let Some(path) = q.path.as_deref().map(str::trim).filter(|p| !p.is_empty()) else {
+        return Ok(Html(templates::new_page(auth, "", None).into_string()).into_response());
+    };
+    if let Err(error) = pages::validate_path(path) {
+        return Ok((
+            StatusCode::BAD_REQUEST,
+            Html(templates::new_page(auth, path, Some(&error.to_string())).into_string()),
+        )
+            .into_response());
+    }
+    if pages::read_meta(&state.pool, path).await?.is_some() {
+        return Ok(Redirect::to(&format!("/wiki/{path}?edit=1")).into_response());
+    }
+    let mut content = seed_page_content(path);
+    match q.template.as_deref() {
+        Some("handoff") => content.push_str("## Goal\n\nWhat should the next person or agent accomplish?\n\n## Current state and evidence\n\n- Verified result and source reference\n\n## Decisions and corrections\n\n- Decision, reason and who made it\n\n## Open questions\n\n- What still needs checking?\n\n## Next action\n\nOne concrete step, owner and completion check.\n"),
+        Some("decision") => content.push_str("## Decision\n\nState what was agreed and by whom.\n\n## Evidence\n\nLink to sources and their revision or date.\n\n## Alternatives considered\n\nRecord relevant tradeoffs and rejected approaches.\n\n## Revisit when\n\nDescribe what would change this decision.\n"),
+        Some("knowledge") => content.push_str("## What we know\n\nState the claim and its scope.\n\n## Sources\n\nLink to evidence and record when it was checked.\n\n## Limits and corrections\n\nMark uncertainty and superseded claims explicitly.\n"),
+        _ => {}
+    }
+    Ok(Html(templates::edit_page(auth, path, &content, None, None).into_string()).into_response())
+}
+
+async fn workspace_guide(State(state): State<AppState>, req: Request) -> Result<Html<String>> {
     let auth = current_auth(req.extensions());
     require_read(&state, auth)?;
-    let recent = pages::recent(&state.pool, 25).await?;
-    Ok(Html(templates::home(auth, &recent).into_string()))
+    Ok(Html(templates::guide(auth).into_string()))
 }
 
 async fn login_form(State(_state): State<AppState>, req: Request) -> Html<String> {
@@ -270,26 +350,47 @@ struct LoginInput {
     password: String,
 }
 
-async fn login_submit(
-    State(state): State<AppState>,
-    req: Request,
-) -> Result<Response> {
+async fn login_submit(State(state): State<AppState>, req: Request) -> Result<Response> {
     let remote = current_remote(req.extensions()).map(|s| s.to_string());
+    // Use the connected peer, never an untrusted forwarded header.
+    let peer = req
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|c| c.0.ip().to_string())
+        .unwrap_or_else(|| "unknown".into());
     let (_parts, body) = req.into_parts();
     let bytes = axum::body::to_bytes(body, 64 * 1024)
         .await
         .map_err(|e| AppError::BadRequest(format!("body: {e}")))?;
     let input: LoginInput = serde_urlencoded::from_bytes(&bytes)
         .map_err(|e| AppError::BadRequest(format!("form: {e}")))?;
+    if input.handle.len() > 64 || input.password.len() > 4096 {
+        return Err(AppError::BadRequest("login fields are too long".into()));
+    }
+    if !state.login_limit.allow(&peer, &input.handle) {
+        return Ok((
+            StatusCode::TOO_MANY_REQUESTS,
+            [(header::RETRY_AFTER, "60")],
+            Html(
+                templates::login(
+                    None,
+                    Some("Too many login attempts. Try again in one minute."),
+                )
+                .into_string(),
+            ),
+        )
+            .into_response());
+    }
 
-    match auth::session::verify_password_login(&state.pool, &input.handle, &input.password).await {
-        Ok(actor) => {
-            let sid = auth::session::create(
-                &state.pool,
-                actor.id,
-                state.config.auth.session_lifetime.as_secs(),
-            )
-            .await?;
+    match auth::session::login(
+        &state.pool,
+        &input.handle,
+        &input.password,
+        state.config.auth.session_lifetime.as_secs(),
+    )
+    .await
+    {
+        Ok((actor, sid)) => {
             auth::log_access(
                 &state.pool,
                 Some(actor.id),
@@ -472,7 +573,23 @@ async fn save_page(
                 remote.as_deref(),
             )
             .await;
-            Err(e)
+            let status = e.status();
+            let reason = if status.is_server_error() {
+                tracing::error!(error = %e, "page save failed");
+                "The server could not finish this request. The write may still complete during recovery. Read the current page before trying again.".to_string()
+            } else {
+                e.to_string()
+            };
+            let current = pages::read_meta(&state.pool, &path).await.ok().flatten();
+            let body = templates::edit_page(
+                Some(&auth),
+                &path,
+                &input.content,
+                current.as_ref(),
+                Some(&reason),
+            )
+            .into_string();
+            Ok((status, Html(body)).into_response())
         }
     }
 }
@@ -486,8 +603,41 @@ async fn history_page(
     require_read(&state, auth)?;
     pages::validate_path(&path)?;
     let meta = pages::read_meta(&state.pool, &path).await?;
-    let commits = pages::history(&state.repo, &path, 50).await.unwrap_or_default();
-    Ok(Html(templates::history(auth, &path, meta.as_ref(), &commits).into_string()))
+    let commits = pages::history(&state.repo, &state.config.paths.content_root, &path, 50).await?;
+    Ok(Html(
+        templates::history(auth, &path, meta.as_ref(), &commits).into_string(),
+    ))
+}
+
+#[derive(Deserialize)]
+struct RevisionQuery {
+    commit: String,
+    source: Option<u8>,
+}
+
+async fn revision_page(
+    State(state): State<AppState>,
+    Path(path): Path<String>,
+    Query(q): Query<RevisionQuery>,
+    req: Request,
+) -> Result<Response> {
+    let auth = current_auth(req.extensions());
+    require_read(&state, auth)?;
+    let content = pages::read_revision(
+        &state.repo,
+        &state.config.paths.content_root,
+        &path,
+        &q.commit,
+    )
+    .await?;
+    if q.source == Some(1) {
+        return Ok((
+            [(header::CONTENT_TYPE, "text/markdown; charset=utf-8")],
+            content,
+        )
+            .into_response());
+    }
+    Ok(Html(templates::revision(auth, &path, &q.commit, &content).into_string()).into_response())
 }
 
 #[derive(Deserialize)]
@@ -548,6 +698,9 @@ async fn api_get_page(
             "layer": page.meta.layer,
             "content": page.content,
             "last_edit_at": page.meta.last_edit_at,
+            "last_edit_by": page.meta.last_edit_by,
+            "last_edit_handle": page.meta.last_edit_handle,
+            "last_edit_type": page.meta.last_edit_type,
             "revision": page.meta.revision,
         });
         axum::Json(body).into_response()
@@ -577,13 +730,8 @@ async fn api_put_page(
     let auth = current_auth(req.extensions()).cloned();
     let auth = require_writer(&state, auth.as_ref())?.clone();
 
-    let summary = headers
-        .get("X-Summary")
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_string());
-    let layer = headers
-        .get("X-Layer")
-        .and_then(|v| v.to_str().ok())
+    let summary = single_header(&headers, "x-summary")?.map(str::to_string);
+    let layer = single_header(&headers, "x-layer")?
         .unwrap_or("semantic")
         .to_string();
 
@@ -676,7 +824,26 @@ fn parse_etag(raw: &str) -> Option<&str> {
     let raw = raw.trim();
     // Weak validators (`W/"…"`) assert semantic rather than byte equality,
     // which is not a distinction a lost-update check can act on.
-    raw.strip_prefix('"')?.strip_suffix('"')
+    let tag = raw.strip_prefix('"')?.strip_suffix('"')?;
+    (!tag.is_empty()
+        && tag
+            .bytes()
+            .all(|b| b.is_ascii_graphic() && b != b'"' && b != b'\\'))
+    .then_some(tag)
+}
+
+fn single_header<'a>(headers: &'a HeaderMap, name: &str) -> Result<Option<&'a str>> {
+    let mut values = headers.get_all(name).iter();
+    let Some(value) = values.next() else {
+        return Ok(None);
+    };
+    if values.next().is_some() {
+        return Err(AppError::BadRequest(format!("{name} must occur only once")));
+    }
+    value
+        .to_str()
+        .map(Some)
+        .map_err(|_| AppError::BadRequest(format!("{name} must contain valid ASCII")))
 }
 
 /// Translate `If-Match` / `If-None-Match` into a precondition.
@@ -686,10 +853,8 @@ fn parse_etag(raw: &str) -> Option<&str> {
 /// of candidate tags is rejected rather than half-supported, because silently
 /// ignoring the extra tags would weaken a guarantee the caller asked for.
 fn precondition_from_headers(headers: &HeaderMap) -> Result<pages::Precondition> {
-    let if_match = headers.get(header::IF_MATCH).and_then(|v| v.to_str().ok());
-    let if_none_match = headers
-        .get(header::IF_NONE_MATCH)
-        .and_then(|v| v.to_str().ok());
+    let if_match = single_header(headers, "if-match")?;
+    let if_none_match = single_header(headers, "if-none-match")?;
 
     match (if_match, if_none_match) {
         (Some(_), Some(_)) => Err(AppError::BadRequest(
@@ -707,9 +872,7 @@ fn precondition_from_headers(headers: &HeaderMap) -> Result<pages::Precondition>
                 parse_etag(m)
                     .map(|rev| pages::Precondition::Revision(rev.to_string()))
                     .ok_or_else(|| {
-                        AppError::BadRequest(
-                            "If-Match must be a quoted entity tag or *".into(),
-                        )
+                        AppError::BadRequest("If-Match must be a quoted entity tag or *".into())
                     })
             }
         }
@@ -751,4 +914,3 @@ fn seed_page_content(path: &str) -> String {
         .replace(['-', '_'], " ");
     format!("# {title}\n\n")
 }
-

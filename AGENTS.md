@@ -10,16 +10,12 @@ repository. A fresh clone has only this file, which is why it exists.
 
 ## Git
 
-**Commits are authored as `wikikiki <wikikiki@aisense.no>`.** Not a personal
-name, not a personal address. The author of a change here is the project.
+Preserve the existing valid Git identity configured by the operator. Do not
+invent an identity or change local or global Git configuration to make a commit
+succeed. If no suitable identity exists, report that instead of creating one.
 
-```sh
-git config user.name  "wikikiki"
-git config user.email "wikikiki@aisense.no"
-```
-
-Set it repo-locally. The address is project-scoped, so a global setting would
-be wrong.
+Create commits only when requested. Pushing requires separate authorization
+unless the requested workflow explicitly includes it.
 
 **No agent identifies itself through Git.** Not in the author or committer
 fields, not in commit messages, not as a `Co-Authored-By:` trailer, not in pull
@@ -75,15 +71,15 @@ cargo test --locked
 That is the whole suite, including the concurrency and cancellation
 regressions. CI runs it on every push and pull request to `main`.
 
-`cargo fmt` and `cargo clippy` do not currently pass on this tree. They run in
-CI as informational checks. Fixing them is welcome; quietly reformatting files
-you were not otherwise touching is not, because it buries the real change.
+Formatting and Clippy are required CI checks. Run `cargo fmt --all -- --check`
+and `cargo clippy --locked --all-targets -- -D warnings` before handing off
+code changes. Keep unrelated formatting out of focused bug fixes.
 
 ## Documentation that must stay true
 
 `README.md` and `DESIGN.md` make specific claims about what the code does —
-including what it deliberately does **not** guarantee, such as recovery after a
-crash between the Git commit and the SQLite transaction. Those limitations are
+including what it deliberately does **not** guarantee, such as recovery from
+lost storage or manual edits outside the write journal. Those limitations are
 load-bearing. If a change makes one of them obsolete, update the document in
 the same commit; if a change cannot deliver what a document promises, say so
 there rather than leaving the promise standing.

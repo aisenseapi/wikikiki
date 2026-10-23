@@ -1,76 +1,52 @@
 # Contributing
 
-Wikikiki is early. The foundation is deliberate and fairly well tested; most of
-the product described in [DESIGN.md](DESIGN.md) is not built yet. That makes it
-a good project to join and an easy one to misread, so this file says where the
-edges are.
+Wikikiki is an early self-hosted workspace for people and agents. Read
+[README.md](README.md) for current behavior, [ROADMAP.md](ROADMAP.md) for
+priorities and [AGENTS.md](AGENTS.md) for repository rules.
 
-## Read these first, in this order
+## Useful contributions
 
-1. **[README.md](README.md)** — what runs today, and what it explicitly does
-   not guarantee. The limitations there are load-bearing, not modesty.
-2. **[ROADMAP.md](ROADMAP.md)** — what is unbuilt, in what order, with
-   completion criteria. This is the closest thing to a list of open work.
-3. **[AGENTS.md](AGENTS.md)** — the repository's working rules. They apply to
-   people and to agents; most of them are about not destroying existing work.
-4. **[DESIGN.md](DESIGN.md)** — the full architecture, including the reasoning
-   behind decisions and the questions still open. Long, but it answers "why is
-   it like this" for almost everything.
+Run the [external handoff pilot](docs/HANDOFF_PILOT.md) or follow
+[the installation and restore guide](docs/SELF_HOSTING.md) on a fresh machine.
+Report what failed, where help was needed and the exact source revision.
+Negative results are useful evidence.
 
-## What would actually help
+Code contributions should solve an observed problem in installation, reliable
+collaboration or operations. New retrieval and memory features need a comparison
+against current behavior and an existing alternative. A proposed feature is not
+novel merely because Wikikiki has not implemented it.
 
-The useful contributions right now are not features. In rough order:
-
-- **Running the [handoff pilot](docs/HANDOFF_PILOT.md)** and reporting what
-  happened. The pilot asks whether shared memory measurably reduces the work
-  of keeping several agents and a human aligned. Nobody has run it. Results —
-  including negative ones — are worth more than code at this stage.
-- **Recovery after a crash between the Git commit and the SQLite transaction.**
-  These are two durability boundaries and no lock spans them. It needs an
-  operation journal and a reconciliation pass at startup. This is the last
-  structural gap in write integrity.
-- **Correction propagation** (ROADMAP M4): recording which conclusions used
-  which sources, so a correction can mark what it invalidates. This is the
-  part of the design that is not already available elsewhere.
-- **Clearing the lint backlog.** `cargo fmt` and `cargo clippy` do not pass.
-  CI reports them without blocking. Fixing them is welcome; reformatting files
-  you were not otherwise touching is not, because it buries the real change.
-
-## Before you open a pull request
+## Checks
 
 ```sh
+cargo fmt --all -- --check
+cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked
 ```
 
-That is the whole suite, including the concurrency, cancellation and
-conditional-write regressions. CI runs it on every pull request.
+Run the sync-client tests documented in scripts/tests when changing that client.
+CI checks formatting, lint and tests. Read tests/page_consistency.rs before
+changing persistence. Preserve correct actor/content attribution, conditional
+updates, cancellation handling and replay of interrupted operations.
 
-If you are changing the write path, read `tests/page_consistency.rs` first. It
-asserts that concurrent writers cannot cross attribution, that an accepted
-write survives its caller disconnecting, and that invalid input changes
-nothing. Those properties were each broken at some point and each cost real
-debugging. If a change makes one of those tests awkward, the change is
-probably wrong.
+Add a regression test for a reproduced bug or a new behavioral guarantee.
+Avoid tests that only restate implementation details. Use isolated temporary
+databases and repositories, never an operator's running instance.
 
-New behaviour should come with a test that fails without it. A test that
-passes both before and after proves nothing.
+## Documentation
 
-## Documentation is part of the change
+The README and current implementation section of DESIGN.md describe the product
+contract. Update them with behavior changes. Keep future proposals explicitly
+marked and record the practical limits of a guarantee. Do not claim automatic
+recovery, access control or integration behavior that has not been implemented
+and tested.
 
-README.md and DESIGN.md make specific claims about what the code does and does
-not do. If your change makes one obsolete, update it in the same commit. If
-your change cannot deliver what a document promises, say so there rather than
-leaving the promise standing.
+## Git and licensing
 
-## Attribution
+Preserve unrelated local work. Review explicit files before staging. Do not add
+credentials, local state or tool attribution to Git. Do not create commits or
+pushes unless requested. Follow the existing valid project identity without
+inventing or changing an identity to make a commit succeed.
 
-Commits in this repository are authored as `wikikiki <wikikiki@aisense.no>`,
-and no tool or agent identifies itself in Git metadata or commit messages. See
-[AGENTS.md](AGENTS.md#git). This is about keeping the history a record of what
-changed rather than of who or what typed it; it is not a claim on your work.
-
-## Licence
-
-By contributing you agree that your work is licensed under the same terms as
-the project: MIT or Apache-2.0, at the user's option. See
-[LICENSE-MIT](LICENSE-MIT) and [LICENSE-APACHE](LICENSE-APACHE).
+Contributions are licensed under MIT or Apache-2.0, at the user's option.
+See [LICENSE-MIT](LICENSE-MIT) and [LICENSE-APACHE](LICENSE-APACHE).

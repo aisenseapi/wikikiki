@@ -1,18 +1,13 @@
 //! Page read/write pipeline.
 //!
-//! Writing a page is a single logical operation that touches four places:
-//! 1. The markdown file on disk under `paths.content_root`.
-//! 2. A git commit attributed to the writing actor.
-//! 3. A row in `pages` (insert or update) + `page_edits`.
-//! 4. The `pages_fts` index.
-//!
-//! Disk → git → DB → FTS, in that order. If DB/FTS update fails after the
-//! commit lands, we surface an error but the commit stays — git is the
-//! authoritative content store; the DB is a derived index that can be
-//! repaired (see DESIGN.md §11 FTS index sync).
+//! A durable SQLite intent precedes each Git commit. Its operation marker
+//! lets recovery reuse the commit, materialize the file, and atomically
+//! publish metadata, attribution and search content. Readers see the last
+//! completed SQLite projection while an accepted write is pending.
 
 use std::path::{Path, PathBuf};
 
+use rand::RngCore;
 use sha2::{Digest, Sha256};
 use sqlx::SqlitePool;
 
@@ -32,20 +27,15 @@ pub struct PageMeta {
     /// an extra query tends to quietly not get shown.
     pub last_edit_handle: Option<String>,
     pub last_edit_type: Option<String>,
-    /// The page's current revision: a hash of its content.
-    ///
-    /// Content-derived rather than a counter, which makes it meaningful on
-    /// its own — "the version that says *this*" — and lets a client verify it
-    /// from bytes it already holds. `None` only for rows written outside this
-    /// service, which therefore cannot prove what a conditional write is
-    /// being applied to.
+    /// Opaque resource revision, changed by every accepted write including
+    /// metadata-only edits. Content checksums are stored separately.
     pub revision: Option<String>,
 }
 
 /// `SELECT` list shared by every page-metadata query, so the column order
 /// the row tuples depend on is written once.
 const PAGE_META_COLUMNS: &str = "p.id, p.path, p.layer, p.title, p.last_edit_at, p.last_edit_by, \
-                                 a.handle, a.type, p.content_hash";
+                                 a.handle, a.type, p.revision";
 
 type PageMetaRow = (
     i64,
@@ -120,7 +110,10 @@ pub enum CurrentState<'a> {
 }
 
 fn short_rev(rev: &str) -> &str {
-    &rev[..rev.len().min(12)]
+    &rev[..rev
+        .char_indices()
+        .nth(12)
+        .map_or(rev.len(), |(offset, _)| offset)]
 }
 
 impl Precondition {
@@ -130,24 +123,18 @@ impl Precondition {
             Precondition::None => Ok(()),
 
             Precondition::Exists if exists => Ok(()),
-            Precondition::Exists => {
-                Err(AppError::PreconditionFailed("page does not exist".into()))
-            }
+            Precondition::Exists => Err(AppError::PreconditionFailed("page does not exist".into())),
 
             Precondition::Absent if !exists => Ok(()),
-            Precondition::Absent => {
-                Err(AppError::PreconditionFailed("page already exists".into()))
-            }
+            Precondition::Absent => Err(AppError::PreconditionFailed("page already exists".into())),
 
             Precondition::Revision(want) => match current {
                 CurrentState::Present(Some(have)) if want == have => Ok(()),
-                CurrentState::Present(Some(have)) => {
-                    Err(AppError::PreconditionFailed(format!(
-                        "page is at revision {}, expected {}",
-                        short_rev(have),
-                        short_rev(want)
-                    )))
-                }
+                CurrentState::Present(Some(have)) => Err(AppError::PreconditionFailed(format!(
+                    "page is at revision {}, expected {}",
+                    short_rev(have),
+                    short_rev(want)
+                ))),
                 // A row this service did not write has no revision to compare
                 // against. Refusing is the only honest answer: the caller
                 // asked to modify a specific version and we cannot tell which
@@ -172,7 +159,9 @@ pub fn validate_path(path: &str) -> Result<()> {
         return Err(AppError::BadRequest("path length out of range".into()));
     }
     if path.starts_with('/') || path.contains('\\') {
-        return Err(AppError::BadRequest("path must be relative, forward-slash only".into()));
+        return Err(AppError::BadRequest(
+            "path must be relative, forward-slash only".into(),
+        ));
     }
     for seg in path.split('/') {
         if seg.is_empty() || seg == "." || seg == ".." {
@@ -181,8 +170,23 @@ pub fn validate_path(path: &str) -> Result<()> {
         if seg.len() > 64 {
             return Err(AppError::BadRequest("segment too long".into()));
         }
-        if !seg.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.')) {
-            return Err(AppError::BadRequest(format!("illegal character in '{seg}'")));
+        if !seg
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+        {
+            return Err(AppError::BadRequest(format!(
+                "illegal character in '{seg}'"
+            )));
+        }
+        let stem = seg.split('.').next().unwrap_or(seg).to_ascii_uppercase();
+        let reserved = matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+            || (stem.len() == 4
+                && (stem.starts_with("COM") || stem.starts_with("LPT"))
+                && matches!(stem.as_bytes()[3], b'1'..=b'9'));
+        if seg.ends_with('.') || seg.eq_ignore_ascii_case(".git") || reserved {
+            return Err(AppError::BadRequest(format!(
+                "non-portable path segment: '{seg}'"
+            )));
         }
     }
     Ok(())
@@ -238,24 +242,74 @@ fn content_hash(s: &str) -> String {
 
 pub async fn read(pool: &SqlitePool, content_root: &Path, page_path: &str) -> Result<Page> {
     validate_path(page_path)?;
-    let meta = read_meta(pool, page_path).await?
+    crate::git::validate_target(content_root, &relative_file_path(page_path))?;
+    // One statement gives metadata and body from the same committed snapshot.
+    // Reading the working file here would expose the next write's bytes with
+    // the previous write's revision between materialization and projection.
+    type SnapshotRow = (
+        i64,
+        String,
+        String,
+        String,
+        Option<i64>,
+        Option<i64>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        i64,
+        Option<String>,
+    );
+    let sql = format!(
+        "SELECT {PAGE_META_COLUMNS}, p.content_hash, p.projection_version,
+        (SELECT content FROM pages_fts WHERE rowid = p.id)
+        FROM pages p LEFT JOIN actors a ON a.id = p.last_edit_by WHERE lower(p.path) = lower(?)"
+    );
+    let row = sqlx::query_as::<_, SnapshotRow>(&sql)
+        .bind(page_path)
+        .fetch_optional(pool)
+        .await?
         .ok_or_else(|| AppError::NotFound(format!("page {page_path}")))?;
-    let fp = file_path(content_root, page_path);
-    let content = std::fs::read_to_string(&fp)
-        .map_err(|e| AppError::Internal(format!("read {}: {e}", fp.display())))?;
+    if row.1 != page_path {
+        return Err(AppError::Conflict(format!(
+            "page path uses different spelling: {}",
+            row.1
+        )));
+    }
+    let content = if row.10 == 0 {
+        std::fs::read_to_string(file_path(content_root, page_path))?
+    } else {
+        row.11
+            .ok_or_else(|| AppError::Internal("page content projection is missing".into()))?
+    };
+    if row.9.as_deref() != Some(content_hash(&content).as_str()) {
+        return Err(AppError::Conflict(
+            "page content differs from its recorded checksum; restore or reconcile it before use"
+                .into(),
+        ));
+    }
+    let meta = page_meta_from_row((
+        row.0, row.1, row.2, row.3, row.4, row.5, row.6, row.7, row.8,
+    ));
     Ok(Page { meta, content })
 }
 
 pub async fn read_meta(pool: &SqlitePool, page_path: &str) -> Result<Option<PageMeta>> {
+    validate_path(page_path)?;
     let sql = format!(
         "SELECT {PAGE_META_COLUMNS}
          FROM pages p LEFT JOIN actors a ON a.id = p.last_edit_by
-         WHERE p.path = ?"
+         WHERE lower(p.path) = lower(?)"
     );
     let row = sqlx::query_as::<_, PageMetaRow>(&sql)
         .bind(page_path)
         .fetch_optional(pool)
         .await?;
+    if row.as_ref().is_some_and(|row| row.1 != page_path) {
+        return Err(AppError::Conflict(
+            "page path uses different spelling".into(),
+        ));
+    }
     Ok(row.map(page_meta_from_row))
 }
 
@@ -293,8 +347,9 @@ pub struct WriteRequest<'a> {
     pub precondition: Precondition,
 }
 
-/// Write (create or update) a page. Performs the full disk → git → DB → FTS
-/// pipeline and returns the updated metadata.
+/// Write a page through the durable intent, Git and projection pipeline.
+/// After intent persistence, recovery may complete a write even if its caller
+/// disconnects or receives an error. Re-read before retrying a failed write.
 pub async fn write(
     pool: &SqlitePool,
     repo: &Repo,
@@ -371,17 +426,19 @@ async fn write_serialized(
         summary,
         precondition,
     } = req;
+    recover_serialized(pool, repo, writer, content_root).await?;
     // Reject invalid input before changing any content or history. The actor
     // ID used by SQLite and the identity written into Git must describe the
     // same active actor, even when this service is called outside HTTP.
-    let active_layer: bool = sqlx::query_scalar(
-        "SELECT EXISTS(SELECT 1 FROM layers WHERE code = ? AND is_active = 1)",
-    )
-    .bind(layer)
-    .fetch_one(pool)
-    .await?;
+    let active_layer: bool =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM layers WHERE code = ? AND is_active = 1)")
+            .bind(layer)
+            .fetch_one(pool)
+            .await?;
     if !active_layer {
-        return Err(AppError::BadRequest(format!("unknown or inactive layer: {layer}")));
+        return Err(AppError::BadRequest(format!(
+            "unknown or inactive layer: {layer}"
+        )));
     }
     let actor = crate::db::queries::actor_by_id(pool, actor_id)
         .await?
@@ -389,103 +446,261 @@ async fn write_serialized(
     if !actor.is_active || actor.actor_type != actor_type || actor.handle != actor_handle {
         return Err(AppError::Forbidden);
     }
+    let author_signature = writer.author_signature(actor_type, actor_handle)?;
 
     // Evaluate the precondition here, not in the handler: the writer lock is
     // already held, so nothing can change the page between this read and the
     // commit below. That ordering is the entire guarantee — the same check
     // one layer up would be a race with a reassuring name.
-    let existing_row: Option<(Option<String>,)> =
-        sqlx::query_as("SELECT content_hash FROM pages WHERE path = ?")
-            .bind(page_path)
-            .fetch_optional(pool)
-            .await?;
+    let existing_row: Option<(String, Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT path, content_hash, revision FROM pages WHERE lower(path) = lower(?)",
+    )
+    .bind(page_path)
+    .fetch_optional(pool)
+    .await?;
     let current = match &existing_row {
-        Some((hash,)) => CurrentState::Present(hash.as_deref()),
+        Some((path, _, revision)) => {
+            if path != page_path {
+                return Err(AppError::Conflict(format!(
+                    "page path uses different spelling: {path}"
+                )));
+            }
+            CurrentState::Present(revision.as_deref())
+        }
         None => CurrentState::Absent,
     };
     precondition.check(current)?;
 
-    // The caller retains this write session through the SQLite commit, so
-    // the database cannot project successful Git writes in reverse order.
-    std::fs::create_dir_all(content_root)?;
-    let prefix = relative_to(repo.root(), content_root).ok_or_else(|| {
-        AppError::Internal(format!(
-            "content root {} is not under repo root {}",
-            content_root.display(),
-            repo.root().display()
-        ))
-    })?;
-    let repo_rel = prefix.join(relative_file_path(page_path));
-    let msg = summary
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| format!("edit: {page_path}"));
-    let commit_oid = writer
-        .write_and_commit(&repo_rel, content, actor_type, actor_handle, &msg)
+    let repo_rel = repository_path(repo, content_root, page_path)?;
+    repo.validate_target(&repo_rel)?;
+    let previous_hash = existing_row.as_ref().and_then(|row| row.1.clone());
+    match std::fs::read_to_string(repo.root().join(&repo_rel)) {
+        Ok(on_disk) if previous_hash.as_deref() == Some(content_hash(&on_disk).as_str()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound && existing_row.is_none() => {}
+        _ => return Err(AppError::Conflict("working file is missing, unindexed, or differs from the recorded page; reconcile it before writing".into())),
+    }
+    let mut random = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut random);
+    let intent = PendingWrite {
+        operation_id: hex::encode(random),
+        page_path: page_path.to_string(),
+        repository_path: repo_rel.to_string_lossy().replace('\\', "/"),
+        layer: layer.to_string(),
+        content: content.to_string(),
+        content_hash: content_hash(content),
+        actor_id,
+        actor_type: actor_type.to_string(),
+        actor_handle: actor_handle.to_string(),
+        author_signature,
+        summary: summary.map(str::to_string),
+        created_at: crate::db::now_ts(),
+        base_commit: repo.head_oid().await?,
+        previous_content_hash: previous_hash,
+    };
+    // Reserve the database writer and recheck activity at acceptance. Actor
+    // deactivation cannot commit between this check and the durable intent.
+    let mut acceptance = pool.begin_with("BEGIN IMMEDIATE").await?;
+    let still_authorized: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM actors WHERE id = ? AND type = ? AND handle = ? AND is_active = 1)
+            AND EXISTS(SELECT 1 FROM layers WHERE code = ? AND is_active = 1)")
+        .bind(actor_id).bind(actor_type).bind(actor_handle).bind(layer)
+        .fetch_one(&mut *acceptance).await?;
+    if !still_authorized {
+        return Err(AppError::Forbidden);
+    }
+    // This commit is the acceptance boundary. No Git or page file has
+    // changed yet. FULL synchronous mode is configured by the database layer.
+    sqlx::query("INSERT INTO pending_page_writes
+        (operation_id, page_path, repository_path, layer, content, content_hash, actor_id,
+         actor_type, actor_handle, author_signature, summary, created_at, base_commit, previous_content_hash)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+        .bind(&intent.operation_id).bind(&intent.page_path).bind(&intent.repository_path).bind(&intent.layer)
+        .bind(&intent.content).bind(&intent.content_hash).bind(intent.actor_id)
+        .bind(&intent.actor_type).bind(&intent.actor_handle).bind(&intent.author_signature).bind(&intent.summary)
+        .bind(intent.created_at).bind(&intent.base_commit).bind(&intent.previous_content_hash)
+        .execute(&mut *acceptance).await?;
+    acceptance.commit().await?;
+    complete_intent(pool, repo, writer, content_root, &intent).await
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct PendingWrite {
+    operation_id: String,
+    page_path: String,
+    repository_path: String,
+    layer: String,
+    content: String,
+    content_hash: String,
+    actor_id: i64,
+    actor_type: String,
+    actor_handle: String,
+    author_signature: String,
+    summary: Option<String>,
+    created_at: i64,
+    base_commit: String,
+    previous_content_hash: Option<String>,
+}
+
+/// Complete accepted writes left by an interrupted process or failed store.
+/// Call before serving traffic. New writes also recover under the same lock.
+/// Out-of-band Git or file changes stop recovery for explicit reconciliation.
+pub async fn recover_pending(pool: &SqlitePool, repo: &Repo, content_root: &Path) -> Result<usize> {
+    let writer = repo.write_session().await;
+    let pool = pool.clone();
+    let repo = repo.clone();
+    let content_root = content_root.to_path_buf();
+    tokio::spawn(async move { recover_serialized(&pool, &repo, &writer, &content_root).await })
+        .await
+        .map_err(|error| AppError::Internal(format!("page recovery task: {error}")))?
+}
+
+async fn recover_serialized(
+    pool: &SqlitePool,
+    repo: &Repo,
+    writer: &WriteSession,
+    content_root: &Path,
+) -> Result<usize> {
+    let pending = sqlx::query_as::<_, PendingWrite>(
+        "SELECT operation_id, page_path, repository_path, layer, content, content_hash, actor_id,
+                actor_type, actor_handle, author_signature, summary, created_at, base_commit, previous_content_hash
+         FROM pending_page_writes ORDER BY created_at, rowid")
+        .fetch_all(pool).await?;
+    for intent in &pending {
+        complete_intent(pool, repo, writer, content_root, intent).await?;
+    }
+    Ok(pending.len())
+}
+
+async fn complete_intent(
+    pool: &SqlitePool,
+    repo: &Repo,
+    writer: &WriteSession,
+    content_root: &Path,
+    intent: &PendingWrite,
+) -> Result<PageMeta> {
+    validate_path(&intent.page_path)?;
+    if intent.operation_id.len() != 64
+        || !intent
+            .operation_id
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+        || content_hash(&intent.content) != intent.content_hash
+    {
+        return Err(AppError::Conflict(
+            "pending page write is corrupt; recovery requires operator review".into(),
+        ));
+    }
+    let repo_rel = repository_path(repo, content_root, &intent.page_path)?;
+    if repo_rel.to_string_lossy().replace('\\', "/") != intent.repository_path {
+        return Err(AppError::Conflict("content root changed since the pending write was accepted; restore its original configuration before recovery".into()));
+    }
+    repo.validate_target(&repo_rel)?;
+    // Refuse to overwrite independent edits, including ones made while the
+    // server was stopped. Missing files can be restored from the intent.
+    match std::fs::read_to_string(repo.root().join(&repo_rel)) {
+        Ok(on_disk) => {
+            let hash = content_hash(&on_disk);
+            if hash != intent.content_hash
+                && intent.previous_content_hash.as_deref() != Some(hash.as_str())
+            {
+                return Err(AppError::Conflict("working file changed outside the pending write; recovery requires operator review".into()));
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    let head = repo.head_oid().await?;
+    let existing_commit = if head == intent.base_commit {
+        None
+    } else {
+        Some(repo.find_operation(&intent.operation_id).await?.ok_or_else(||
+            AppError::Conflict("Git HEAD changed outside the pending write; recovery requires operator review".into()))?)
+    };
+    let commit_oid = if let Some(oid) = existing_commit {
+        if head != oid
+            || repo.file_at_commit(&oid, &repo_rel).await?.as_deref()
+                != Some(intent.content.as_str())
+        {
+            return Err(AppError::Conflict(
+                "Git changed outside the pending write; recovery requires operator review".into(),
+            ));
+        }
+        oid
+    } else {
+        let message = intent
+            .summary
+            .clone()
+            .unwrap_or_else(|| format!("edit: {}", intent.page_path));
+        writer
+            .commit_content(
+                &repo_rel,
+                &intent.content,
+                &intent.author_signature,
+                &message,
+                Some(&intent.operation_id),
+                Some(&intent.base_commit),
+            )
+            .await?
+    };
+    writer
+        .materialize(&repo_rel, &intent.content, &intent.operation_id)
         .await?;
-
-    // 3 + 4. DB and FTS, in one transaction.
-    //
-    // The metadata row, its edit record and the search index are three views
-    // of a single fact ("this page now says that"). Committing them
-    // separately can leave search returning text that no page contains, or a
-    // page with no attribution for its latest edit. Git remains the
-    // authoritative content store. A process crash or database failure still
-    // needs reconciliation: this transaction cannot roll back a Git commit.
-    let now = crate::db::now_ts();
-    let title = derive_title(content, page_path);
-    let hash = content_hash(content);
-
-    // Reserve the SQLite writer before reading the old row. A deferred
-    // read-to-write upgrade can fail immediately with SQLITE_BUSY rather
-    // than honoring the busy timeout when bookkeeping writes contend.
+    let title = derive_title(&intent.content, &intent.page_path);
+    let now = intent.created_at;
+    // Metadata, audit record, body projection and journal deletion share one
+    // transaction. Failure leaves the intent available for the next attempt.
     let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
 
     let existing: Option<(i64,)> = sqlx::query_as("SELECT id FROM pages WHERE path = ?")
-        .bind(page_path)
+        .bind(&intent.page_path)
         .fetch_optional(&mut *tx)
         .await?;
 
     let page_id = if let Some((prev_id,)) = existing {
         sqlx::query(
-            "UPDATE pages SET title = ?, content_hash = ?, updated_at = ?, last_edit_at = ?, last_edit_by = ?, layer = ?
+            "UPDATE pages SET title = ?, content_hash = ?, updated_at = ?, last_edit_at = ?, last_edit_by = ?, layer = ?, revision = ?, projection_version = 1
              WHERE id = ?",
         )
         .bind(&title)
-        .bind(&hash)
+        .bind(&intent.content_hash)
         .bind(now)
         .bind(now)
-        .bind(actor_id)
-        .bind(layer)
+        .bind(intent.actor_id)
+        .bind(&intent.layer)
+        .bind(&intent.operation_id)
         .bind(prev_id)
         .execute(&mut *tx)
         .await?;
         prev_id
     } else {
         sqlx::query_scalar::<_, i64>(
-            "INSERT INTO pages(path, layer, title, content_hash, created_at, updated_at, last_edit_at, last_edit_by)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
+            "INSERT INTO pages(path, layer, title, content_hash, created_at, updated_at, last_edit_at, last_edit_by, revision, projection_version)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1) RETURNING id",
         )
-        .bind(page_path)
-        .bind(layer)
+        .bind(&intent.page_path)
+        .bind(&intent.layer)
         .bind(&title)
-        .bind(&hash)
+        .bind(&intent.content_hash)
         .bind(now)
         .bind(now)
         .bind(now)
-        .bind(actor_id)
+        .bind(intent.actor_id)
+        .bind(&intent.operation_id)
         .fetch_one(&mut *tx)
         .await?
     };
 
     sqlx::query(
-        "INSERT INTO page_edits(page_id, actor_id, git_commit, summary, created_at)
-         VALUES (?, ?, ?, ?, ?)",
+        "INSERT INTO page_edits(page_id, actor_id, git_commit, summary, created_at, operation_id, layer)
+         VALUES (?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(page_id)
-    .bind(actor_id)
+    .bind(intent.actor_id)
     .bind(&commit_oid)
-    .bind(summary)
+    .bind(&intent.summary)
     .bind(now)
+    .bind(&intent.operation_id)
+    .bind(&intent.layer)
     .execute(&mut *tx)
     .await?;
 
@@ -497,35 +712,92 @@ async fn write_serialized(
     sqlx::query("INSERT INTO pages_fts(rowid, title, content, path) VALUES (?, ?, ?, ?)")
         .bind(page_id)
         .bind(&title)
-        .bind(content)
-        .bind(page_path)
+        .bind(&intent.content)
+        .bind(&intent.page_path)
         .execute(&mut *tx)
         .await?;
 
+    sqlx::query("DELETE FROM pending_page_writes WHERE operation_id = ?")
+        .bind(&intent.operation_id)
+        .execute(&mut *tx)
+        .await?;
     tx.commit().await?;
 
     Ok(PageMeta {
         id: page_id,
-        path: page_path.to_string(),
-        layer: layer.to_string(),
+        path: intent.page_path.clone(),
+        layer: intent.layer.clone(),
         title,
         last_edit_at: Some(now),
-        last_edit_by: Some(actor_id),
-        last_edit_handle: Some(actor_handle.to_string()),
-        last_edit_type: Some(actor_type.to_string()),
-        revision: Some(hash),
+        last_edit_by: Some(intent.actor_id),
+        last_edit_handle: Some(intent.actor_handle.clone()),
+        last_edit_type: Some(intent.actor_type.clone()),
+        revision: Some(intent.operation_id.clone()),
     })
 }
 
-fn relative_to(root: &Path, child: &Path) -> Option<PathBuf> {
-    let root = root.canonicalize().ok()?;
-    let child = child.canonicalize().ok()?;
-    child.strip_prefix(&root).ok().map(|p| p.to_path_buf())
+fn repository_path(repo: &Repo, content_root: &Path, page_path: &str) -> Result<PathBuf> {
+    validate_path(page_path)?;
+    let configured_root = std::path::absolute(repo.root())?;
+    let configured_content = std::path::absolute(content_root)?;
+    if let Ok(prefix) = configured_content.strip_prefix(&configured_root) {
+        // Inspect the configured spelling before canonicalization can erase
+        // evidence of an intermediate symlink, reparse point or case alias.
+        repo.validate_target(&prefix.join(relative_file_path(page_path)))?;
+    }
+    // Resolve existing ancestors without creating directories before acceptance.
+    let root = repo.root().canonicalize()?;
+    let mut ancestor = content_root.to_path_buf();
+    let mut suffix = Vec::new();
+    while !ancestor.exists() {
+        suffix.push(
+            ancestor
+                .file_name()
+                .ok_or_else(|| AppError::BadRequest("invalid content root".into()))?
+                .to_os_string(),
+        );
+        if !ancestor.pop() {
+            return Err(AppError::BadRequest("invalid content root".into()));
+        }
+    }
+    let mut child = ancestor.canonicalize()?;
+    for segment in suffix.iter().rev() {
+        child.push(segment);
+    }
+    let prefix = child.strip_prefix(&root).map_err(|_| {
+        AppError::BadRequest("content root must be inside the content repository".into())
+    })?;
+    let relative = prefix.join(relative_file_path(page_path));
+    repo.validate_target(&relative)?;
+    Ok(relative)
 }
 
-pub async fn history(repo: &Repo, page_path: &str, limit: usize) -> Result<Vec<CommitInfo>> {
-    validate_path(page_path)?;
-    repo.file_history(&relative_file_path(page_path), limit).await
+pub async fn history(
+    repo: &Repo,
+    content_root: &Path,
+    page_path: &str,
+    limit: usize,
+) -> Result<Vec<CommitInfo>> {
+    repo.file_history(&repository_path(repo, content_root, page_path)?, limit)
+        .await
+}
+
+/// Read one page at a complete immutable commit ID. The mapping is identical
+/// to current pages and cannot select arbitrary repository files.
+pub async fn read_revision(
+    repo: &Repo,
+    content_root: &Path,
+    page_path: &str,
+    commit: &str,
+) -> Result<String> {
+    if !matches!(commit.len(), 40 | 64) || !commit.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(AppError::BadRequest(
+            "revision must be a complete hexadecimal Git commit ID".into(),
+        ));
+    }
+    repo.file_at_commit(commit, &repository_path(repo, content_root, page_path)?)
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("page {page_path} at revision {commit}")))
 }
 
 #[derive(Debug, Clone)]
@@ -552,6 +824,9 @@ pub async fn search(pool: &SqlitePool, query: &str, limit: i64) -> Result<Vec<Se
         return Ok(Vec::new());
     }
     let q = fts_match_query(query);
+    if q.is_empty() {
+        return Ok(Vec::new());
+    }
     let rows = sqlx::query_as::<_, (String, String, String)>(
         "SELECT path, title, snippet(pages_fts, 1, char(1), char(2), '…', 16) AS snippet
          FROM pages_fts WHERE pages_fts MATCH ?
@@ -581,7 +856,11 @@ fn fts_match_query(q: &str) -> String {
                 .chars()
                 .filter(|c| c.is_alphanumeric() || matches!(c, '-' | '_'))
                 .collect();
-            if t.is_empty() { None } else { Some(format!("\"{t}\"*")) }
+            if !t.chars().any(char::is_alphanumeric) {
+                None
+            } else {
+                Some(format!("\"{t}\"*"))
+            }
         })
         .collect::<Vec<_>>()
         .join(" ")
@@ -615,7 +894,12 @@ mod tests {
     #[test]
     fn distinct_paths_map_to_distinct_files() {
         let cases = [
-            "notes", "notes.old", "notes/v1.2", "notes/v1.9", "a.b.c", "readme.md",
+            "notes",
+            "notes.old",
+            "notes/v1.2",
+            "notes/v1.9",
+            "a.b.c",
+            "readme.md",
         ];
         for p in cases {
             assert!(validate_path(p).is_ok(), "{p} should be a legal path");
@@ -700,7 +984,9 @@ mod tests {
     #[test]
     fn exists_and_absent_are_mirror_images() {
         assert!(Precondition::Exists.check(present("x")).is_ok());
-        assert!(Precondition::Exists.check(CurrentState::Present(None)).is_ok());
+        assert!(Precondition::Exists
+            .check(CurrentState::Present(None))
+            .is_ok());
         assert!(matches!(
             Precondition::Exists.check(CurrentState::Absent),
             Err(AppError::PreconditionFailed(_))

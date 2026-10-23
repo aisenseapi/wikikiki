@@ -1,9 +1,60 @@
-# Wikikiki — Design Document
+# Wikikiki design and proposals
 
-> A wiki that is the live memory of a system of actors — human, agent, and machine — observable and editable in real time.
+Wikikiki is a self-hosted workspace for people and agents.
 
-**Stack:** Rust · SQLite (with FTS5) · Markdown · Git · Web UI
-**Status:** Design draft — to be refined as the project evolves.
+**Stack:** Rust, SQLite with FTS5, Markdown, Git and a web UI.
+
+## Current implementation contract
+
+This section and README.md describe implemented behavior. The numbered sections
+below preserve the wider design proposal. Their example configuration, schema,
+endpoints, background tasks and memory features are not implementation promises.
+Use wikikiki.example.toml, migrations/ and docs/AGENT_API.md for actual interfaces.
+
+The product is distributed to other operators to run on their own machines.
+It supports one trusted group per instance. All authenticated actors share page
+access. Anonymous reading is off by default. Actor types provide attribution,
+not different page permissions. Operators administer credentials through the
+CLI. Password reset revokes sessions. Tokens have independent lifecycles.
+
+Page writes enter one application service. Validation and revision checks run
+under a repository writer lock. A process-level file lock also prevents separate
+Wikikiki instances from opening the same content repository. SQLite uses WAL
+with synchronous FULL. A pending-write row stores the immutable payload, actor,
+layer and operation identifier before Git is changed. The operation identifies
+its Git commit. Replay checks for that commit before creating another one.
+
+After Git and the disk projection are written, one SQLite transaction updates
+the published page snapshot, edit records and FTS, then removes the pending
+intent. Startup and the next write finish pending operations. A failure during
+replay prevents startup or further writes until the cause is repaired. There is
+no cross-storage transaction. Physical loss of storage and manual Git/DB edits
+are outside this protocol. Backups must contain both SQLite and the full Git
+repository at one stopped boundary.
+
+Process interruption is the tested recovery scope. Sudden host power loss is
+not yet verified across Git object and ref durability boundaries. An abrupt
+kill may leave a Git lock file. Recovery reports this rather than deleting
+unknown locks that could belong to another operation.
+
+New page revisions identify operations and change on metadata-only edits.
+Legacy content hashes remain valid until the next write. Clients treat revisions
+as opaque ETags. If-Match and If-None-Match protect shared writes. A missing
+condition retains unconditional replacement for legacy API clients. There is no
+request idempotency key or automatic merge. A failed or disconnected request may
+still complete, so clients re-read before retrying.
+
+Reads of journal-era pages return published content and metadata from the same
+SQLite snapshot. Legacy file-backed rows validate the file hash before use.
+Case aliases and unsafe portable paths are rejected without renaming existing
+content. Direct filesystem edits are not an import interface.
+
+The UI provides page creation templates, editing, named authors, history and
+search. It does not receive live updates. Browser conflicts retain the draft
+in the response. FTS is lexical search. L1 working memory, state machines, MCP,
+distillation, dependency propagation and per-resource visibility remain proposals.
+
+See ROADMAP.md for the delivery order and docs/SELF_HOSTING.md for operations.
 
 ---
 
@@ -488,16 +539,16 @@ SQLite has one writer at a time. For Wikikiki, with potentially many `agent` act
 
 SQLite handles surprisingly high concurrent loads when configured this way (well into hundreds of writes/sec). If we ever exceed that, the migration path to PostgreSQL is short because sqlx supports both.
 
-### FTS5 index sync
+### FTS5 index sync (proposal and implementation boundary)
 
-Page content lives on disk (per §10) but is indexed in `pages_fts`. This is a sync point that can drift if the two get out of step (e.g. content edited directly on disk by an operator, files moved by git operations).
+The implemented write journal publishes content, metadata and FTS together as
+described above. Operators must use the API to publish edits. Directly changing
+files or Git branches does not publish a new page revision.
 
-The mechanism:
-- Every write through the page API updates both the file and the FTS index in the same logical operation.
-- The `pages.content_hash` column (sha256 of file content) is updated on every write. A background `system` task periodically rehashes files and compares; mismatches trigger an FTS reindex and a `system` audit entry.
-- An admin endpoint (`POST /admin/fts/reindex`) can force a full reindex; it writes to `admin_audit`.
-
-This is a conservative approach: drift is *expected to happen occasionally* (it's an out-of-band consistency problem), and the recovery is automatic and audited.
+Potential future additions are an explicit file-import command, a verified
+reindex operation and drift reporting. No background rehash task or
+`POST /admin/fts/reindex` endpoint exists today. An import must preserve actor
+attribution and revision checks rather than treating any changed file as trusted.
 
 ### Live-edit vs. restart-required configuration
 

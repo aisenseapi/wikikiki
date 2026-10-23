@@ -4,6 +4,7 @@
 //! attribution, list per-file history. No long-lived `Repository` handle —
 //! every call re-opens. Writes serialize on `write_lock`; reads are stateless.
 
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -17,6 +18,9 @@ pub struct Repo {
     root: PathBuf,
     write_lock: Arc<Mutex<()>>,
     author_template: String,
+    // An OS lock complements the in-process mutex. Clones share ownership;
+    // opening the same repository independently must not create a second writer.
+    _process_lock: Arc<std::fs::File>,
 }
 
 /// One write order shared by Git and the page service's database projection.
@@ -45,6 +49,17 @@ impl Repo {
         if !root.exists() {
             std::fs::create_dir_all(root)?;
         }
+        let process_lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(root.join(".wikikiki-writer.lock"))?;
+        process_lock.try_lock().map_err(|error| {
+            AppError::Conflict(format!(
+                "content repository is already in use or cannot be locked: {error}"
+            ))
+        })?;
         let has_repo = root.join(".git").exists();
         if !has_repo {
             let repo = gix::init(root).map_err(err)?;
@@ -57,6 +72,7 @@ impl Repo {
             root: root.to_path_buf(),
             write_lock: Arc::new(Mutex::new(())),
             author_template: author_template.to_string(),
+            _process_lock: Arc::new(process_lock),
         })
     }
 
@@ -108,9 +124,52 @@ impl Repo {
     pub async fn wait_for_writes(&self) {
         let _guard = self.write_lock.lock().await;
     }
+
+    pub(crate) fn validate_target(&self, relpath: &Path) -> Result<()> {
+        validate_target(&self.root, relpath)
+    }
+
+    pub(crate) async fn head_oid(&self) -> Result<String> {
+        let root = self.root.clone();
+        tokio::task::spawn_blocking(move || {
+            let repo = gix::open(root).map_err(err)?;
+            Ok(repo.head_id().map_err(err)?.detach().to_string())
+        })
+        .await
+        .map_err(|e| AppError::Internal(format!("join: {e}")))?
+    }
+
+    /// Find a committed intent after a crash between Git and SQLite.
+    pub(crate) async fn find_operation(&self, operation_id: &str) -> Result<Option<String>> {
+        let root = self.root.clone();
+        let operation_id = operation_id.to_string();
+        tokio::task::spawn_blocking(move || {
+            let repo = gix::open(root).map_err(err)?;
+            let head = repo.head_id().map_err(err)?;
+            for item in repo.rev_walk([head]).all().map_err(err)? {
+                let item = item.map_err(err)?;
+                let commit = repo.find_commit(item.id).map_err(err)?;
+                let message = commit.decode().map_err(err)?.message.to_string();
+                if operation_metadata(&message)
+                    .is_some_and(|(operation, _)| operation == operation_id)
+                {
+                    return Ok(Some(item.id.to_string()));
+                }
+            }
+            Ok(None)
+        })
+        .await
+        .map_err(|e| AppError::Internal(format!("join: {e}")))?
+    }
 }
 
 impl WriteSession {
+    pub(crate) fn author_signature(&self, actor_type: &str, actor_handle: &str) -> Result<String> {
+        let rendered = render_author(&self.repo.author_template, actor_type, actor_handle);
+        parse_sig(&rendered)?;
+        Ok(rendered)
+    }
+
     pub(crate) async fn write_and_commit(
         &self,
         relpath: &Path,
@@ -119,10 +178,35 @@ impl WriteSession {
         actor_handle: &str,
         message: &str,
     ) -> Result<String> {
+        let author = self.author_signature(actor_type, actor_handle)?;
+        let oid = self
+            .commit_content(relpath, content, &author, message, None, None)
+            .await?;
+        self.materialize(relpath, content, &oid).await?;
+        Ok(oid)
+    }
+
+    pub(crate) async fn commit_content(
+        &self,
+        relpath: &Path,
+        content: &str,
+        author: &str,
+        message: &str,
+        operation_id: Option<&str>,
+        expected_head: Option<&str>,
+    ) -> Result<String> {
+        self.repo.validate_target(relpath)?;
         let root = self.repo.root.clone();
-        let author = render_author(&self.repo.author_template, actor_type, actor_handle);
+        let (name, email) = parse_sig(author)?;
         let relpath = relpath.to_path_buf();
-        let message = message.to_string();
+        let message = match operation_id {
+            Some(operation) => format!(
+                "{message}\n\nWikikiki-Operation: {operation}\nWikikiki-Path: {}\n",
+                relpath.to_string_lossy().replace('\\', "/")
+            ),
+            None => message.to_string(),
+        };
+        let expected_head = expected_head.map(str::to_string);
         let content = content.as_bytes().to_vec();
         let guard = self.guard.clone();
 
@@ -131,18 +215,23 @@ impl WriteSession {
             // Keep the lock with the worker until its file/Git writes finish.
             let _guard = guard;
             let repo = gix::open(&root).map_err(err)?;
-            let abs_path = root.join(&relpath);
-            if let Some(parent) = abs_path.parent() {
-                std::fs::create_dir_all(parent)?;
+            let parent_id = repo.head_id().map_err(err)?.detach();
+            if expected_head
+                .as_deref()
+                .is_some_and(|expected| expected != parent_id.to_string())
+            {
+                return Err(AppError::Conflict(
+                    "Git HEAD changed outside the pending write; recovery requires operator review"
+                        .into(),
+                ));
             }
-            std::fs::write(&abs_path, &content)?;
             let blob_id = repo.write_blob(&content).map_err(err)?.detach();
 
             // Build the new tree by editing the parent commit's tree (or
             // an empty tree if there is no parent yet). This bypasses the
             // working-tree/index plumbing entirely — wikikiki has no
             // checkout, so the index would only be incidental state.
-            let parent_id_opt = repo.head_id().ok().map(|id| id.detach());
+            let parent_id_opt = Some(parent_id);
             let parent_tree_id = match parent_id_opt {
                 Some(commit_id) => {
                     let commit = repo.find_commit(commit_id).map_err(err)?;
@@ -154,13 +243,59 @@ impl WriteSession {
             let new_tree_id = edit_tree_with_blob(&repo, parent_tree_id, &path_bs, blob_id)?;
 
             let parent_ids: Vec<gix::ObjectId> = parent_id_opt.into_iter().collect();
-            let (name, email) = parse_sig(&author);
             let sig = make_signature(&name, &email);
             let commit_id = repo
                 .commit_as(&sig, &sig, "HEAD", message.clone(), new_tree_id, parent_ids)
                 .map_err(err)?;
 
             Ok(commit_id.detach().to_string())
+        })
+        .await
+        .map_err(|e| AppError::Internal(format!("join: {e}")))?
+    }
+
+    /// Publish a complete file only after its immutable Git object exists.
+    /// Repeating this operation is safe after a failed projection or restart.
+    pub(crate) async fn materialize(
+        &self,
+        relpath: &Path,
+        content: &str,
+        operation_id: &str,
+    ) -> Result<()> {
+        let root = self.repo.root.clone();
+        let relpath = relpath.to_path_buf();
+        let content = content.as_bytes().to_vec();
+        let operation_id = operation_id.to_string();
+        let guard = self.guard.clone();
+        tokio::task::spawn_blocking(move || {
+            let _guard = guard;
+            validate_target(&root, &relpath)?;
+            let destination = root.join(&relpath);
+            let parent = destination
+                .parent()
+                .ok_or_else(|| AppError::BadRequest("page has no parent directory".into()))?;
+            std::fs::create_dir_all(parent)?;
+            let temporary = parent.join(format!(".wikikiki-write-{operation_id}.tmp"));
+            // An interrupted attempt may have left its own temporary file.
+            if temporary.exists() {
+                let metadata = std::fs::symlink_metadata(&temporary)?;
+                if is_link(&metadata) || !metadata.is_file() {
+                    return Err(AppError::Conflict("unsafe recovery temporary file".into()));
+                }
+                std::fs::remove_file(&temporary)?;
+            }
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temporary)?;
+            file.write_all(&content)?;
+            file.sync_all()?;
+            drop(file);
+            validate_target(&root, &relpath)?;
+            std::fs::rename(&temporary, &destination)?;
+            #[cfg(unix)]
+            std::fs::File::open(parent)?.sync_all()?;
+            Ok(())
         })
         .await
         .map_err(|e| AppError::Internal(format!("join: {e}")))?
@@ -187,7 +322,9 @@ impl Repo {
                 return Ok(None);
             };
             let obj = repo.find_object(blob_id).map_err(err)?;
-            Ok(Some(String::from_utf8_lossy(&obj.data).into_owned()))
+            Ok(Some(String::from_utf8(obj.data.clone()).map_err(|_| {
+                AppError::Conflict("historical page is not valid UTF-8".into())
+            })?))
         })
         .await
         .map_err(|e| AppError::Internal(format!("join: {e}")))?
@@ -267,9 +404,9 @@ fn make_signature(name: &str, email: &str) -> gix::actor::Signature {
 /// Convert a relative path (no leading slash, '/'-separated) into a
 /// gix-friendly BString. Backslashes are normalised to forward slashes.
 fn path_to_bstring(p: &Path) -> Result<BString> {
-    let s = p.to_str().ok_or_else(|| {
-        AppError::BadRequest(format!("non-utf8 path: {}", p.display()))
-    })?;
+    let s = p
+        .to_str()
+        .ok_or_else(|| AppError::BadRequest(format!("non-utf8 path: {}", p.display())))?;
     Ok(BString::from(s.replace('\\', "/")))
 }
 
@@ -282,8 +419,8 @@ fn edit_tree_with_blob(
     path: &BString,
     blob_id: gix::ObjectId,
 ) -> Result<gix::ObjectId> {
-    let starting_id = parent_tree_id
-        .unwrap_or_else(|| gix::ObjectId::empty_tree(repo.object_hash()));
+    let starting_id =
+        parent_tree_id.unwrap_or_else(|| gix::ObjectId::empty_tree(repo.object_hash()));
     let mut editor = repo.edit_tree(starting_id).map_err(err)?;
     editor
         .upsert(path.as_bstr(), gix::object::tree::EntryKind::Blob, blob_id)
@@ -295,6 +432,12 @@ fn edit_tree_with_blob(
 /// Did this commit change the file at `target` relative to its first parent?
 /// First-parent only — sufficient for our linear-history use case.
 fn commit_touched(repo: &gix::Repository, commit: &gix::Commit, target: &BStr) -> Result<bool> {
+    // Metadata-only writes have the same blob but are still attributed edits.
+    let decoded = commit.decode().map_err(err)?;
+    let message = decoded.message.to_string();
+    if operation_metadata(&message).is_some_and(|(_, path)| path == target) {
+        return Ok(true);
+    }
     let this_tree_id = commit.tree_id().map_err(err)?;
     let this_blob = lookup_path_in_tree(repo, this_tree_id.detach(), target)?;
     let parents: Vec<_> = commit.parent_ids().collect();
@@ -305,6 +448,21 @@ fn commit_touched(repo: &gix::Repository, commit: &gix::Commit, target: &BStr) -
     let parent_tree_id = parent_commit.tree_id().map_err(err)?;
     let parent_blob = lookup_path_in_tree(repo, parent_tree_id.detach(), target)?;
     Ok(this_blob != parent_blob)
+}
+
+/// Only the final generated trailer pair is authoritative. User summaries
+/// may contain arbitrary lines, including apparent trailers for other pages.
+fn operation_metadata(message: &str) -> Option<(&str, &str)> {
+    let mut lines = message.trim_end_matches('\n').lines().rev();
+    let path = lines.next()?.strip_prefix("Wikikiki-Path: ")?;
+    let operation = lines.next()?.strip_prefix("Wikikiki-Operation: ")?;
+    if path.is_empty()
+        || operation.len() != 64
+        || !operation.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return None;
+    }
+    Some((operation, path))
 }
 
 /// Walk into nested trees and return the blob OID at `path`, if any.
@@ -356,15 +514,92 @@ fn render_author(template: &str, actor_type: &str, actor_handle: &str) -> String
         .replace("{actor_handle}", actor_handle)
 }
 
-fn parse_sig(rendered: &str) -> (String, String) {
-    if let Some(open) = rendered.find('<') {
-        if let Some(close) = rendered.find('>') {
-            let name = rendered[..open].trim().to_string();
-            let email = rendered[open + 1..close].to_string();
-            return (name, email);
+fn parse_sig(rendered: &str) -> Result<(String, String)> {
+    let invalid = || AppError::BadRequest("invalid Git author signature".into());
+    if rendered.chars().any(char::is_control) {
+        return Err(invalid());
+    }
+    let (name, email) = match (rendered.find('<'), rendered.find('>')) {
+        (Some(open), Some(close))
+            if open < close
+                && !rendered[..open].contains('>')
+                && !rendered[open + 1..close].contains(['<', '>'])
+                && rendered[close + 1..].trim().is_empty() =>
+        {
+            (rendered[..open].trim(), rendered[open + 1..close].trim())
+        }
+        (None, None) => (rendered.trim(), "anonymous@wikikiki.local"),
+        _ => return Err(invalid()),
+    };
+    if name.is_empty() || email.is_empty() || email.chars().any(char::is_whitespace) {
+        return Err(invalid());
+    }
+    Ok((name.to_string(), email.to_string()))
+}
+
+fn is_link(metadata: &std::fs::Metadata) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        metadata.file_attributes() & 0x400 != 0
+    }
+    #[cfg(not(windows))]
+    {
+        metadata.file_type().is_symlink()
+    }
+}
+
+/// Reject symlinks, reparse points, case aliases and file/directory collisions
+/// before content or history is changed. This also protects existing imports.
+pub(crate) fn validate_target(root: &Path, relpath: &Path) -> Result<()> {
+    let mut current = root.to_path_buf();
+    let components: Vec<_> = relpath.components().collect();
+    if components.is_empty() {
+        return Err(AppError::BadRequest("empty content path".into()));
+    }
+    for (index, component) in components.iter().enumerate() {
+        let std::path::Component::Normal(segment) = component else {
+            return Err(AppError::BadRequest("content path must be relative".into()));
+        };
+        let name = segment.to_string_lossy();
+        if name.eq_ignore_ascii_case(".git") {
+            return Err(AppError::BadRequest(
+                "Git metadata is not wiki content".into(),
+            ));
+        }
+        if current.is_dir() {
+            for entry in std::fs::read_dir(&current)? {
+                let actual = entry?.file_name();
+                if actual.to_string_lossy().eq_ignore_ascii_case(&name)
+                    && actual.as_os_str() != *segment
+                {
+                    return Err(AppError::Conflict(format!(
+                        "content path aliases existing name {}",
+                        actual.to_string_lossy()
+                    )));
+                }
+            }
+        }
+        current.push(segment);
+        match std::fs::symlink_metadata(&current) {
+            Ok(metadata) => {
+                if is_link(&metadata) {
+                    return Err(AppError::Conflict(
+                        "symlinks and reparse points are not supported in content paths".into(),
+                    ));
+                }
+                let last = index + 1 == components.len();
+                if (last && !metadata.is_file()) || (!last && !metadata.is_dir()) {
+                    return Err(AppError::Conflict(
+                        "content path collides with a file or directory".into(),
+                    ));
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
         }
     }
-    (rendered.to_string(), "anonymous@wikikiki.local".to_string())
+    Ok(())
 }
 
 #[cfg(test)]
@@ -383,7 +618,7 @@ mod tests {
 
     #[test]
     fn parse_sig_basic() {
-        let (n, e) = parse_sig("human:alice <alice@wikikiki.local>");
+        let (n, e) = parse_sig("human:alice <alice@wikikiki.local>").expect("valid signature");
         assert_eq!(n, "human:alice");
         assert_eq!(e, "alice@wikikiki.local");
     }
@@ -459,8 +694,14 @@ mod tests {
             let r = repo.clone();
             let rel = rel.clone();
             tasks.push(tokio::spawn(async move {
-                r.write_and_commit(&rel, &format!("body {i}"), "agent", &format!("a{i}"), "edit")
-                    .await
+                r.write_and_commit(
+                    &rel,
+                    &format!("body {i}"),
+                    "agent",
+                    &format!("a{i}"),
+                    "edit",
+                )
+                .await
             }));
         }
         for t in tasks {

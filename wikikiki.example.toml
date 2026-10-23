@@ -1,6 +1,7 @@
-# wikikiki — example operator config
-# Copy to wikikiki.toml and edit. Every value has a sensible default;
-# you can ship with an empty config and the server still runs.
+# Wikikiki operator config. Copy to wikikiki.toml and edit.
+# Relative paths resolve from the process working directory, not this file.
+# The Docker image uses /data. The systemd service uses /var/lib/wikikiki.
+# An explicitly supplied --config path must exist.
 
 [paths]
 content_root      = "./content"
@@ -13,16 +14,18 @@ public_url        = "http://localhost:8090"
 
 [ui]
 markdown_renderer    = "comrak"
-allow_anonymous_read = true
+allow_anonymous_read = false
 require_auth_for_write = true
 
 [auth]
 session_lifetime       = "30d"
 token_default_lifetime = "1y"
 log_remote_addr        = "hashed"        # 'plain' | 'hashed' | 'none'
+# Secure session cookies follow an https:// public_url automatically.
+# Leave cookie_secure unset unless you need an explicit override.
 
 [git]
 author_template = "{actor_type}:{actor_handle} <{actor_handle}@wikikiki.local>"
 
-# Stage 1 defers L1, distillation, real-time, MCP, conflicts, rate limits, loop detection.
-# Their config blocks live in DESIGN.md §4 and will activate as later stages land.
+# Authentication grants access to the shared workspace. There are no page ACLs.
+# No credentials belong in this file. Issue and revoke them with the CLI.

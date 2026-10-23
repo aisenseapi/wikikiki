@@ -2,7 +2,7 @@
 name = "wikikiki"
 version = "0.1.0"
 edition = "2021"
-description = "A wiki that is the live memory of a system of actors."
+description = "A self-hosted workspace for people and agents."
 license = "MIT OR Apache-2.0"
 
 [[bin]]

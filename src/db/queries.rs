@@ -1,7 +1,7 @@
 //! Hand-rolled DB queries. Kept un-`query!()`-macro'd so the project compiles
 //! without a live database at build time.
 
-use sqlx::SqlitePool;
+use sqlx::{Executor, Sqlite, SqlitePool};
 
 use crate::error::Result;
 
@@ -16,12 +16,15 @@ pub struct Actor {
     pub is_active: bool,
 }
 
-pub async fn actor_by_id(pool: &SqlitePool, id: i64) -> Result<Option<Actor>> {
+pub async fn actor_by_id<'e, E>(executor: E, id: i64) -> Result<Option<Actor>>
+where
+    E: Executor<'e, Database = Sqlite>,
+{
     let row = sqlx::query_as::<_, (i64, String, String, String, i64, i64)>(
         "SELECT id, type, name, handle, is_admin, is_active FROM actors WHERE id = ?",
     )
     .bind(id)
-    .fetch_optional(pool)
+    .fetch_optional(executor)
     .await?;
     Ok(row.map(|r| Actor {
         id: r.0,
@@ -33,12 +36,15 @@ pub async fn actor_by_id(pool: &SqlitePool, id: i64) -> Result<Option<Actor>> {
     }))
 }
 
-pub async fn actor_by_handle(pool: &SqlitePool, handle: &str) -> Result<Option<Actor>> {
+pub async fn actor_by_handle<'e, E>(executor: E, handle: &str) -> Result<Option<Actor>>
+where
+    E: Executor<'e, Database = Sqlite>,
+{
     let row = sqlx::query_as::<_, (i64, String, String, String, i64, i64)>(
         "SELECT id, type, name, handle, is_admin, is_active FROM actors WHERE handle = ?",
     )
     .bind(handle)
-    .fetch_optional(pool)
+    .fetch_optional(executor)
     .await?;
     Ok(row.map(|r| Actor {
         id: r.0,
@@ -52,13 +58,17 @@ pub async fn actor_by_handle(pool: &SqlitePool, handle: &str) -> Result<Option<A
 
 /// Insert an actor; returns the new id. Caller is responsible for
 /// writing the credential row (or rows) and any admin_audit entry.
-pub async fn insert_actor(
-    pool: &SqlitePool,
+pub async fn insert_actor<'e, E>(
+    executor: E,
     actor_type: &str,
     name: &str,
     handle: &str,
     is_admin: bool,
-) -> Result<i64> {
+) -> Result<i64>
+where
+    E: Executor<'e, Database = Sqlite>,
+{
+    crate::actor::validate_handle(handle)?;
     let now = super::now_ts();
     let id = sqlx::query_scalar::<_, i64>(
         "INSERT INTO actors(type, name, handle, is_admin, is_active, created_at)
@@ -69,7 +79,7 @@ pub async fn insert_actor(
     .bind(handle)
     .bind(is_admin as i64)
     .bind(now)
-    .fetch_one(pool)
+    .fetch_one(executor)
     .await?;
     Ok(id)
 }
